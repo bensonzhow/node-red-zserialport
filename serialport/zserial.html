@@ -12,10 +12,10 @@
 
 <script type="text/javascript">
     RED.nodes.registerType('zserialin',{
-        category: 'network',
+        category: 'zutils',
         defaults: {
             name: {name:""},
-            serial: {type:"serial-port",required:true}
+            serial: {type:"serial-port",required:false}
         },
         color:"BurlyWood",
         inputs:0,
@@ -48,7 +48,7 @@
         category: 'network',
         defaults: {
             name: {name:""},
-            serial: {type:"serial-port",required:true}
+            serial: {type:"serial-port",required:false}
         },
         color:"BurlyWood",
         inputs:1,
@@ -81,7 +81,7 @@
         category: 'network',
         defaults: {
             name: {name:""},
-            serial: {type:"serial-port",required:true}
+            serial: {type:"serial-port",required:false}
         },
         color:"BurlyWood",
         inputs:1,
@@ -382,7 +382,7 @@
         category: 'network',
         defaults: {
             name: {name:""},
-            serial: {type:"serial-port",required:true}
+            serial: {type:"serial-port",required:false}
         },
         color:"BurlyWood",
         inputs:1,

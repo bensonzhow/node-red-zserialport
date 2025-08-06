@@ -1,5 +1,5 @@
 {
-    "name"          : "node-red-node-serialport",
+    "name"          : "node-red-zserial",
     "version"       : "2.0.3",
     "description"   : "Node-RED nodes to talk to serial ports",
     "dependencies"  : {
@@ -7,7 +7,7 @@
     },
     "repository" : {
         "type":"git",
-        "url":"https://github.com/node-red/node-red-nodes.git",
+        "url":"https://github.com/bensonzhow/node-red-zserialport.git",
         "directory": "tree/master/io/serialport"
     },
     "license": "Apache-2.0",
@@ -19,12 +19,5 @@
         }
     },
     "engines" : { "node" : ">=16.0.0" },
-    "author": {
-        "name": "Dave Conway-Jones",
-        "email": "dceejay@gmail.com",
-        "url": "http://nodered.org"
-    },
-    "contributors" : [
-        "@yhur"
-    ]
+    "contributors" : []
 }
