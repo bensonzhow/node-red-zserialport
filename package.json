@@ -1,0 +1,26 @@
+{
+    "name": "node-zserial",
+    "version": "1.0.0",
+    "description": "Node-RED nodes to talk to serial ports",
+    "dependencies": {
+        "serialport": "^12.0.0"
+    },
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/bensonzhow/node-red-zserialport.git"
+    },
+    "keywords": [
+        "node-red",
+        "serial"
+    ],
+    "node-red": {
+        "version": ">=3.0.0",
+        "nodes": {
+            "zserial": "zserial.js"
+        }
+    },
+    "engines": {
+        "node": ">=16.0.0"
+    },
+    "contributors": []
+}

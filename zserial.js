@@ -11,7 +11,7 @@ module.exports = function(RED) {
     // TODO: 'serialPool' should be encapsulated in SerialPortNode
 
     // Configuration Node
-    function SerialPortNode(n) {
+    function zSerialPortNode(n) {
         RED.nodes.createNode(this,n);
         this.serialport = n.serialport;
         this.newline = n.newline; /* overloaded: split character, timeout, or character count */
@@ -46,10 +46,10 @@ module.exports = function(RED) {
         }
 
     }
-    RED.nodes.registerType("zserialport",SerialPortNode);
+    RED.nodes.registerType("zserialport",zSerialPortNode);
 
     // receives msgs and sends them to the serial port
-    function SerialOutNode(n) {
+    function zSerialOutNode(n) {
         RED.nodes.createNode(this,n);
         this.serialConfig = RED.nodes.getNode(n.serial);
 
@@ -100,10 +100,10 @@ module.exports = function(RED) {
             node.status({fill:"grey",shape:"ring",text:"serial.status.stopped"});
         });
     }
-    RED.nodes.registerType("zserialout",SerialOutNode);
+    RED.nodes.registerType("zserialout",zSerialOutNode);
 
     // receives data from the serial port and emits msgs
-    function SerialInNode(n) {
+    function zSerialInNode(n) {
         RED.nodes.createNode(this,n);
         this.serialConfig = RED.nodes.getNode(n.serial);
 
@@ -142,11 +142,11 @@ module.exports = function(RED) {
         }
         setCallback(node)
     }
-    RED.nodes.registerType("zserialin",SerialInNode);
+    RED.nodes.registerType("zserialin",zSerialInNode);
 
 
     // request data and waits for reply
-    function SerialRequestNode(n) {
+    function zSerialRequestNode(n) {
         RED.nodes.createNode(this,n);
         this.serial = n.serial;
         this.serialConfig = RED.nodes.getNode(this.serial);
@@ -229,11 +229,11 @@ module.exports = function(RED) {
             }
         });
     }
-    RED.nodes.registerType("zserialrequest", SerialRequestNode);
+    RED.nodes.registerType("zserialrequest", zSerialRequestNode);
 
 
     // control node to stop, start, reconfigure ports
-    function SerialControlNode(n) {
+    function zSerialControlNode(n) {
         const configProps = [
             "serialport", "serialbaud", "databits", "parity", "stopbits",
             "dtr", "rts", "cts", "dsr"
@@ -284,7 +284,7 @@ module.exports = function(RED) {
             node.send({payload:currentConfig});
         });
     }
-    RED.nodes.registerType("zserialcontrol", SerialControlNode);
+    RED.nodes.registerType("zserialcontrol", zSerialControlNode);
 
     var serialPool = (function() {
         var connections = {};
@@ -577,7 +577,7 @@ module.exports = function(RED) {
         }
     }());
 
-    RED.httpAdmin.get("/serialports", RED.auth.needsPermission('serial.read'), function(req,res) {
+    RED.httpAdmin.get("/zserialports", RED.auth.needsPermission('serial.read'), function(req,res) {
         SerialPort.list().then(
             ports => {
                 const a = ports.map(p => p.path);

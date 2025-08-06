@@ -45,7 +45,7 @@
 
 <script type="text/javascript">
     RED.nodes.registerType('zserialout',{
-        category: 'network',
+        category: 'zutils',
         defaults: {
             name: {name:""},
             serial: {type:"serial-port",required:false}
@@ -78,7 +78,7 @@
 
 <script type="text/javascript">
     RED.nodes.registerType('zserialrequest',{
-        category: 'network',
+        category: 'zutils',
         defaults: {
             name: {name:""},
             serial: {type:"serial-port",required:false}
@@ -366,7 +366,7 @@
     });
 </script>
 
-<script type="text/html" data-template-name="serial control">
+<script type="text/html" data-template-name="zserialcontrol">
     <div class="form-row">
         <label for="node-inputoutput-name"><i class="fa fa-tag"></i> <span data-i18n="node-red:common.label.name"></span></label>
         <input type="text" id="node-input-name" data-i18n="[placeholder]node-red:common.label.name">
@@ -378,8 +378,8 @@
 </script>
 
 <script type="text/javascript">
-    RED.nodes.registerType('serial control',{
-        category: 'network',
+    RED.nodes.registerType('zserialcontrol',{
+        category: 'zutils',
         defaults: {
             name: {name:""},
             serial: {type:"serial-port",required:false}
