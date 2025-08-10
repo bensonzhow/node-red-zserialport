@@ -63,14 +63,14 @@ node-zserialport
 
 要控制通信，向控制节点发送 **msg.payload**。
 
-    {
+  {
   "serialport": "/dev/ttyUSB0",
   "serialbaud": 115200,
   "databits": 8,
   "parity": "none",
   "stopbits": 1,
   "enabled": true
-    }
+  }
 
 可以动态更改串口及其配置。
 
@@ -96,3 +96,18 @@ node-zserialport
 
 任何输入消息都会导致节点输出当前端口配置。
 
+### MAC
+
+mac 模拟串口
+
+***
+socat -d -d pty,raw,echo=0 pty,raw,echo=0
+
+socat -d -d pty,raw,echo=0 pty,raw,echo=0 | socat -d -d -d -d pty,raw,echo=0
+***
+
+连接串口 
+
+***
+screen /dev/ttys003 9600
+***
