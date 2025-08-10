@@ -1,143 +1,84 @@
 
-<script type="text/html" data-help-name="serial in">
-    <p>Reads data from a local serial port.</p>
-    <h3>Outputs</h3>
+<script type="text/html" data-help-name="zserial in">
+    <p>从本地串口读取数据。</p>
+    <h3>输出</h3>
     <dl class="message-properties">
         <dt>payload <span class="property-type">string | buffer</span></dt>
-        <dd>received data via the serial port</dd>
+        <dd>通过串口接收到的数据</dd>
         <dt>port <span class="property-type">string</span></dt>
-        <dd>name of the serial port</dd>
+        <dd>串口名称</dd>
     </dl>
-    <p>The node can either
+    <p>该节点可以
         <ul>
-            <li>wait for a "split" character (default \n).
-                Also accepts escaped shortcut (e.g. \n) or hex notation (0x0d).</li>
-            <li>wait for a timeout in milliseconds from the first character received.</li>
-            <li>wait for a silence time in milliseconds after the last character received.</li>
-            <li>wait to fill a fixed sized buffer.</li>
+            <li>等待一个“分隔”字符（默认 \n）。也接受转义快捷方式（如 \n）或十六进制表示（0x0d）。</li>
+            <li>从接收到第一个字符开始，等待指定的超时时间（毫秒）。</li>
+            <li>在接收到最后一个字符后，等待指定的静默时间（毫秒）。</li>
+            <li>等待填满固定大小的缓冲区。</li>
         </ul>
     </p>
-    <p>It then outputs <code>msg.payload</code> as either a UTF-8 ASCII string or a binary buffer object.</p>
-    <p><code>msg.port</code> is set to the name of the port selected.</p>
-    <p>If no split character is specified, or a timeout or buffer size of 0,
-       then a stream of single characters is sent -
-       again either as ASCII chars or size 1 binary buffers.</p>
+    <p>然后输出 <code>msg.payload</code>，类型为 UTF-8 ASCII 字符串或二进制缓冲区对象。</p>
+    <p><code>msg.port</code> 设置为所选串口的名称。</p>
+    <p>如果未指定分隔字符，或超时时间或缓冲区大小为 0，
+       则会以单字符流的方式发送数据——同样可以是 ASCII 字符或长度为 1 的二进制缓冲区。</p>
 </script>
 
-<script type="text/html" data-help-name="serial out">
-    <p>Send data via a local serial port.</p>
-    <h3>Inputs</h3>
+<script type="text/html" data-help-name="zserial out">
+    <p>通过本地串口发送数据。</p>
+    <h3>输入</h3>
     <dl class="message-properties">
         <dt>payload <span class="property-type">string | buffer</span></dt>
-        <dd>data to be sent via the serial port</dd>
+        <dd>要通过串口发送的数据</dd>
         <dt class="optional">baudrate <span class="property-type">string</span></dt>
-        <dd>baudrate of the serial port (optional)</dd>
+        <dd>串口波特率（可选）</dd>
     </dl>
-    <p>Only the <code>msg.payload</code> is sent.</p>
-    <p>Optionally the baudrate can be changed using <code>msg.baudrate</code>.</p>
-    <p>Optionally the new line character used to split the input
-       can be appended to every message sent out to the serial port.</p>
-    <p>Binary payloads can be sent by using a buffer object.</p>
+    <p>仅发送 <code>msg.payload</code>。</p>
+    <p>可以通过 <code>msg.baudrate</code> 可选地更改波特率。</p>
+    <p>可选地，每条发送到串口的消息都可以自动追加用于分隔输入的新行字符。</p>
+    <p>可以通过缓冲区对象发送二进制数据。</p>
 </script>
 
-<script type="text/html" data-help-name="serial request">
-    <p>Provides a connection to a request/response serial port.</p>
-    <p>This node behaves as a tightly coupled combination of <code>serial in</code> and <code>serial out</code> nodes,
-       with which it shares the configuration.</p>
-    <p>Send the request message in <code>msg.payload</code> as you would do with a <code>serial out</code> node.
-       The message will be forwarded to the serial port following a strict FIFO (First In, First Out) queue,
-       waiting for a single response before transmitting the next request.
-       Once a response is received (with the same logic of a <code>serial in</code> node), or after a timeout occurs,
-       a message is sent to the output (see Outputs below),
-       with <code>msg.payload</code> containing the received response (or missing in case if timeout) and
-       all other properties are preserved.</p>
-    <p>For consistency with the <code>serial in</code> node, <code>msg.port</code> is set to the name of the port selected.</p>
-    <h3>Inputs</h3>
+<script type="text/html" data-help-name="zserial request">
+    <p>提供一个请求/响应串口的连接。</p>
+    <p>该节点的行为类似于 <code>serial in</code> 和 <code>serial out</code> 节点的紧密结合，并共享其配置。</p>
+    <p>像使用 <code>serial out</code> 节点一样，将请求消息放在 <code>msg.payload</code> 中发送。
+       消息将按照严格的 FIFO（先进先出）队列转发到串口，每次等待一个响应后才发送下一个请求。
+       一旦收到响应（与 <code>serial in</code> 节点的逻辑相同），或发生超时，
+       将向输出发送一条消息（见下方输出），
+       <code>msg.payload</code> 包含收到的响应（如超时则无），
+       其他属性保持不变。</p>
+    <p>为与 <code>serial in</code> 节点一致，<code>msg.port</code> 设置为所选串口的名称。</p>
+    <h3>输入</h3>
     <ul>
-        <li><code>msg.timeout</code> is the timeout (in ms) after which the incoming message is propagated
-            to the output with <code>msg.status</code> set to <code>"ERR_TIMEOUT"</code> and missing payload.
-            If not present, the default value is 10000 (10s).</li>
-        <li><code>msg.count</code> if set this will override the configured number of characters
-            as long as it is less than the number configured.</li>
-        <li><code>msg.waitfor</code> must be a single character, escape code, or hex code.
-            If set, the node will wait until it matches that character in the stream and then start the output.</li>
-        <li>Optionally the baudrate can be changed using <code>msg.baudrate</code></li>
+        <li><code>msg.timeout</code> 为超时时间（毫秒），超时后将带 <code>msg.status</code> 为 <code>"ERR_TIMEOUT"</code> 且无 payload 的消息输出。
+            如果未设置，默认值为 10000（10 秒）。</li>
+        <li><code>msg.count</code> 如果设置，将覆盖配置的字符数，只要小于配置值。</li>
+        <li><code>msg.waitfor</code> 必须为单个字符、转义码或十六进制码。
+            如果设置，节点将在数据流中匹配到该字符后开始输出。</li>
+        <li>可选地通过 <code>msg.baudrate</code> 更改波特率。</li>
     </ul>
-    <h3>Outputs</h3>
+    <h3>输出</h3>
     <ul>
-        <li><code>msg.payload</code> is the response. If no response occured, this property is removed.</li>
-        <li><code>msg.status</code> is <code>"OK"</code> in case a response is received,
-            or <code>"ERR_TIMEOUT"</code> if a timeout occurs.</li>
-        <li>Any other property coming from the input will be preserved.</li>
+        <li><code>msg.payload</code> 为响应内容。如无响应则该属性被移除。</li>
+        <li><code>msg.status</code> 为 <code>"OK"</code>（收到响应）或 <code>"ERR_TIMEOUT"</code>（超时）。</li>
+        <li>输入消息的其他属性将被保留。</li>
     </ul>
 </script>
 
-<script type="text/html" data-help-name="serial-port">
-    <p>Configuration options for a local serial port.</p>
-    <p>The search button should return a list of available serial ports to choose from,
-       or you can type in the location if known.</p>
-    <p>The DTR, RTS, CTS and DSR switches can be used to permanently pull the corresponding flow control pin high or low,
-       e.g. in order to power devices via those pins.</p>
-    <p>The node can optionally wait until it matches a pre-defined character.</p>
-    <p>The serial data reception can either
+<script type="text/html" data-help-name="zserial-port">
+    <p>本地串口的配置选项。</p>
+    <p>点击搜索按钮可返回可用串口列表，或可直接输入已知串口位置。</p>
+    <p>DTR、RTS、CTS 和 DSR 开关可用于永久拉高或拉低相应的流控引脚，例如通过这些引脚为设备供电。</p>
+    <p>节点可选地等待匹配预定义字符。</p>
+    <p>串口数据接收方式可以
         <ul>
-            <li>wait for a "split" character (default \n). Also accepts escaped shortcut (e.g. \n) or hex notation (0x0d).</li>
-            <li>wait for a timeout in milliseconds from the first character received.</li>
-            <li>wait for a silence time in milliseconds after the last character received.</li>
-            <li>wait to fill a fixed sized buffer.</li>
+            <li>等待一个“分隔”字符（默认 \n）。也接受转义快捷方式（如 \n）或十六进制表示（0x0d）。</li>
+            <li>从接收到第一个字符开始，等待指定的超时时间（毫秒）。</li>
+            <li>在接收到最后一个字符后，等待指定的静默时间（毫秒）。</li>
+            <li>等待填满固定大小的缓冲区。</li>
         </ul>
     </p>
-    <p>It then outputs the received data as either a UTF-8 ASCII string or a binary buffer object.</p>
-    <p>If no split character is specified, or a timeout or buffer size of 0, then a stream of single characters is sent -
-       again either as ASCII chars or size 1 binary buffers.</p>
-    <p>Optionally the new line character used to split the input
-       can be appended to every message sent out to the serial port.</p>
+    <p>然后输出接收到的数据，类型为 UTF-8 ASCII 字符串或二进制缓冲区对象。</p>
+    <p>如果未指定分隔字符，或超时时间或缓冲区大小为 0，则会以单字符流的方式发送数据——同样可以是 ASCII 字符或长度为 1 的二进制缓冲区。</p>
+    <p>可选地，每条发送到串口的消息都可以自动追加用于分隔输入的新行字符。</p>
 </script>
 
-<script type="text/html" data-help-name="serial control">
-    <p>Stops, starts the serial communication and changes the serial port configuration.</p>
-
-    <p>This node provides the ability to:</p>
-    <ul>
-        <li>stop the communication and release the serial port.</li>
-        <li>reopen the port and restart the communications.</li>
-        <li>change the serial port and the configuration dynamically.</li>
-        <li>query the serial port configuration.</li>
-    </ul>
-
-    <h3>Inputs</h3>
-        <p>In order to control the communication, just send <b>msg.payload</b> containing.</p>
-        <pre>
-{
-    "serialport": "/dev/ttyUSB0",
-    "serialbaud": 115200,
-    "databits": 8,
-    "parity": "none",
-    "stopbits": 1,
-    "enabled": true
-}
-        </pre>
-
-        <p>The following optional parameters will change the configuration only if they are present.</p>
-        <p>Any combination of them can be passed to change/control the serial communication</p>
-        <ul>
-            <li> serialport </li>
-            <li> serialbaud </li>
-            <li> databits </li>
-            <li> parity </li>
-            <li> stopbits </li>
-            <li> dtr </li>
-            <li> rts </li>
-            <li> cts </li>
-            <li> dsr </li>
-            <li> enabled </li>
-        </ul>
-        <p>If the <code>enabled</code> property is not present, it will default to <code>true</code>.</p>
-        <p>
-            <code>{"enabled":true}</code> or <code>{"enabled":false}</code> will start or stop the communication.</p>
-            <p>If <code>enabled</code> is passed along with other parameters, the configuration will be changed and the
-                port will be either started or remain stopped, ready to be started later depending on its value.</p>
-
-    <h3>Outputs</h3>
-    <p><code>msg.payload</code> containing the serial port configuration.</p>
-</script>

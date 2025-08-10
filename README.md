@@ -1,86 +1,81 @@
-node-red-node-serialport
+node-zserialport
 ========================
 
-<a href="http://nodered.org" target="noderedinfo">Node-RED</a> nodes to talk to
-hardware serial ports.
+<a href="http://nodered.org" target="noderedinfo">Node-RED</a> 节点，用于与硬件串口通信。
+![node-red-zserialport](images/demo.png)
 
-## Install
+## 安装
 
-To install the stable version use the `Menu - Manage palette - Install` option and search for node-red-node-serialport, or run the following command in your Node-RED user directory, typically `~/.node-red`
+要安装稳定版本，可以使用 `菜单 - 管理调色板 - 安装` 选项并搜索 node-zserialport，或者在你的 Node-RED 用户目录（通常为 `~/.node-red`）下运行以下命令：
 
-        npm i node-red-node-serialport
+  npm i node-zserialport
 
-During install there may be multiple messages about optional compilation.
-These may look like failures... as they report as failure to compile errors -
-but often are warnings and the node will continue to install and, assuming nothing else
-failed, you should be able to use it. Occasionally some platforms *will* require
-you to install the full set of tools in order to compile the underlying package.
+安装过程中可能会出现多条关于可选编译的消息。
+这些消息看起来像是失败……因为它们报告为编译错误失败——但通常只是警告，节点会继续安装，如果没有其他错误，你应该可以正常使用。有些平台*确实*需要你安装完整的工具集来编译底层包。
 
-## Usage
+## 用法
 
-Provides four nodes - one to receive messages, and one to send, a request node which can send then wait for a response, and a control node that allows dynamic control of the ports in use.
+提供四个节点——一个用于接收消息，一个用于发送，一个请求节点可以发送并等待响应，还有一个关闭所使用的端口。
 
-### Input
+### 输入
 
-Reads data from a local serial port.
+从本地串口读取数据。
 
-Clicking on the search icon will attempt to autodetect serial ports attached to
-the device, however you many need to manually specify it. COM1, /dev/ttyUSB0, etc
+点击搜索图标会尝试自动检测连接到设备的串口，但你可能需要手动指定，比如 COM1、/dev/ttyUSB0 等。
 
-It can either
+它可以：
 
- - wait for a "split" character (default \n). Also accepts hex notation (0x0a).
- - wait for a timeout in milliseconds from the first character received
- - wait to fill a fixed sized buffer
+ - 等待一个“分隔”字符（默认 \n），也接受十六进制表示（0x0a）。
+ - 等待从接收到第一个字符起的超时时间（毫秒）
+ - 等待填满一个固定大小的缓冲区
 
-It then outputs `msg.payload` as either a UTF8 ascii string or a binary Buffer object.
+然后会将 `msg.payload` 输出为 UTF8 ascii 字符串或二进制 Buffer 对象。
 
-If no split character is specified, or a timeout or buffer size of 0, then a stream
-of single characters is sent - again either as ascii chars or size 1 binary buffers.
+如果没有指定分隔字符，或超时时间或缓冲区大小为 0，则会以流的形式发送单个字符——同样可以是 ascii 字符或长度为 1 的二进制 buffer。
 
-### Output
+### 输出
 
-Provides a connection to an outbound serial port.
+提供一个到外部串口的连接。
 
-Only the `msg.payload` is sent.
+只会发送 `msg.payload`。
 
-Optionally the character used to split the input can be appended to every message sent out to the serial port.
+可选地，可以将用于分割输入的字符附加到每条发送到串口的消息后面。
 
-### Request
+### 请求
 
-Provides a connection to a request/response serial port.
+提供一个请求/响应串口的连接。
 
-This node behaves as a tightly coupled combination of serial in and serial out nodes, with which it shares the configuration.
+该节点行为类似于串口输入和输出节点的紧密结合，并共享配置。
 
-Send the request message in `msg.payload` as you would do with a serial out node. The message will be forwarded to the serial port following a strict FIFO (First In, First Out) queue, waiting for a single response before transmitting the next request. Once a response is received (with the same logic of a serial in node), or after a timeout occurs, a message is produced on the output, with msg.payload containing the received response (or missing in case if timeout), msg.status containing relevant info, and all other fields preserved.
+像使用串口输出节点一样，将请求消息放在 `msg.payload` 中发送。消息会按照严格的 FIFO（先进先出）队列转发到串口，等待单个响应后才会发送下一个请求。一旦收到响应（逻辑同串口输入节点），或超时发生，就会在输出端产生一条消息，msg.payload 包含收到的响应（或超时时为空），msg.status 包含相关信息，其他字段保持不变。
 
-For consistency with the serial in node, msg.port is also set to the name of the port selected.
+为了与串口输入节点保持一致，msg.port 也会被设置为所选端口的名称。
 
-### Control
+### 控制
 
-When the node-red starts, the flow(program) picks up the pre-programmed serial port, open it, and starts the communication. But there are some cases the port needs to switch to a different port, stop, and start again. For example, in order to upload a new binary for Arduino, the serial port needs to be stopped relased from the nodered, and start it again after uploading. Or when the FTDI device re-connects after disconnecting for any reason, it may be possible that the port number changes, and the end user of the flow can't change the port.
+当 node-red 启动时，流程（程序）会选取预设的串口，打开并开始通信。但有些情况下需要切换到不同的端口、停止并重新启动。例如，为 Arduino 上传新固件时，需要先停止串口、释放串口，然后上传后再重新启动。或者当 FTDI 设备因某种原因断开后重新连接，端口号可能会变化，流程的最终用户无法更改端口。
 
-This node provides the ability to:
+该节点提供以下能力：
 
-  1. change the serial port and its configuration on the run time programatically.
-  2. stop the communication and release the serial port.
-  3. reopen the port and restart the communications.
+  1. 在运行时以编程方式更改串口及其配置。
+  2. 停止通信并释放串口。
+  3. 重新打开端口并重启通信。
 
-In order to control the communication, send a **msg.payload** to the control node.
+要控制通信，向控制节点发送 **msg.payload**。
 
     {
-        "serialport": "/dev/ttyUSB0",
-        "serialbaud": 115200,
-        "databits": 8,
-        "parity": "none",
-        "stopbits": 1,
-        "enabled": true
+  "serialport": "/dev/ttyUSB0",
+  "serialbaud": 115200,
+  "databits": 8,
+  "parity": "none",
+  "stopbits": 1,
+  "enabled": true
     }
 
-changes the serial port and the configuration on the fly.  
+可以动态更改串口及其配置。
 
-The following optional parameters will change the configuration only if they are present.
-Any combination of them can be passed to change/control the serial communication
+以下可选参数仅在存在时更改配置。
+可以任意组合传递它们来更改/控制串口通信：
 
  - serialport
  - serialbaud
@@ -93,10 +88,11 @@ Any combination of them can be passed to change/control the serial communication
  - dsr
  - enabled
 
-If the `enabled` property is not present, it will default to `true`.
+如果未提供 `enabled` 属性，则默认为 `true`。
 
-`{"enabled":true}` or `{"enabled":false}` will start or stop the communication.
+`{"enabled":true}` 或 `{"enabled":false}` 将启动或停止通信。
 
-If `enabled` is passed along with other parameters, the configuration will be changed and the port will be either started or remain stopped, ready to be started later depending on its value.
+如果 `enabled` 与其他参数一起传递，则会更改配置，并根据其值启动或保持停止，准备稍后启动。
 
-Any input message will cause the node to output the current port configuration.
+任何输入消息都会导致节点输出当前端口配置。
+
