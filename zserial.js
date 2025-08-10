@@ -129,11 +129,14 @@ module.exports = function (RED) {
             onMsg(msg, send, done);
         })
 
-
-
-        function setCallback() {
+        function getConnection() { 
             let conns = serialPool.curConnections();
             let connKeys = Object.keys(conns) || [];
+            return { conns, connKeys }
+        }
+
+        function setCallback() {
+            let { conns, connKeys } = getConnection();
             // node.warn(connKeys);
             node.status({ fill: "green", shape: "dot", text: "当前连接数：" + connKeys.length });
 
@@ -152,16 +155,19 @@ module.exports = function (RED) {
                     node.send(msgout);
                 });
                 curPort.on('ready', function () {
+                    let { conns, connKeys } = getConnection();
                     //node.status({ fill: "green", shape: "dot", text: "node-red:common.status.connected" });
                     node.status({ fill: "green", shape: "dot", text: "当前连接数：" + connKeys.length });
 
                 });
                 curPort.on('closed', function () {
+                    let { conns, connKeys } = getConnection();
                     //node.status({ fill: "red", shape: "ring", text: "node-red:common.status.not-connected" });
                     node.status({ fill: "green", shape: "dot", text: "当前连接数：" + connKeys.length });
 
                 });
                 curPort.on('stopped', function () {
+                    let { conns, connKeys } = getConnection();
                     //node.status({ fill: "grey", shape: "ring", text: "serial.status.stopped" });
                     node.status({ fill: "green", shape: "dot", text: "当前连接数：" + connKeys.length });
 
