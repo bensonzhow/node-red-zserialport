@@ -2,7 +2,7 @@
     {
         "id": "ac7bf7ec36d6a989",
         "type": "function",
-        "z": "6c5cb5c635f82b56",
+        "z": "d83ba3a0e79165f6",
         "name": "发送内容",
         "func": "msg.serialConfig=msg.serialPorts;\nmsg.payload=msg.serialConfig.serialport+\"\\n\";\nreturn msg;",
         "outputs": 1,
@@ -11,11 +11,10 @@
         "initialize": "",
         "finalize": "",
         "libs": [],
-        "x": 680,
-        "y": 160,
+        "x": 580,
+        "y": 240,
         "wires": [
             [
-                "1bbc5a3a00e0c543",
                 "cc85519d5a973bd6"
             ]
         ]
@@ -23,7 +22,7 @@
     {
         "id": "1b8e7a8fee300657",
         "type": "inject",
-        "z": "6c5cb5c635f82b56",
+        "z": "d83ba3a0e79165f6",
         "name": "",
         "props": [],
         "repeat": "",
@@ -31,8 +30,8 @@
         "once": false,
         "onceDelay": 0.1,
         "topic": "",
-        "x": 310,
-        "y": 100,
+        "x": 210,
+        "y": 180,
         "wires": [
             [
                 "fcaaa0d1d662e5c5"
@@ -42,7 +41,7 @@
     {
         "id": "c5b2a60e99954c23",
         "type": "debug",
-        "z": "6c5cb5c635f82b56",
+        "z": "d83ba3a0e79165f6",
         "name": "=========调试 6",
         "active": true,
         "tosidebar": true,
@@ -52,14 +51,14 @@
         "targetType": "full",
         "statusVal": "",
         "statusType": "auto",
-        "x": 1050,
-        "y": 200,
+        "x": 950,
+        "y": 240,
         "wires": []
     },
     {
         "id": "2e52a7d5dcba1731",
         "type": "split",
-        "z": "6c5cb5c635f82b56",
+        "z": "d83ba3a0e79165f6",
         "name": "",
         "splt": "\\n",
         "spltType": "str",
@@ -68,28 +67,29 @@
         "stream": false,
         "addname": "",
         "property": "serialPorts",
-        "x": 670,
-        "y": 100,
+        "x": 570,
+        "y": 180,
         "wires": [
             [
-                "ac7bf7ec36d6a989"
+                "ac7bf7ec36d6a989",
+                "de1ba17b88689674"
             ]
         ]
     },
     {
         "id": "fcaaa0d1d662e5c5",
         "type": "function",
-        "z": "6c5cb5c635f82b56",
+        "z": "d83ba3a0e79165f6",
         "name": "窗口配置数组",
-        "func": "let serialPorts = [\n    {\n        serialport: '/dev/ttys018',\n        baud: 9600,\n        databits: 8,\n        parity: 'NONE',\n        stopbits: 1\n    },\n    {\n        serialport:'/dev/ttys021',\n        baud:9600,\n        databits:8,\n        parity:'NONE',\n        stopbits:1\n    }\n];\nmsg.serialPorts=serialPorts;\nreturn msg;",
+        "func": "let serialPorts = [\n    {\n        serialport:'/dev/ttys027',\n        baud:9600,\n        databits:8,\n        parity:'NONE',\n        stopbits:1,\n        responsetimeout:3\n    },\n    {\n        serialport: '/dev/ttys018',\n        baud: 9600,\n        databits: 8,\n        parity: 'NONE',\n        stopbits: 1,\n        responsetimeout:5\n    },\n    \n];\nmsg.serialPorts=serialPorts;\nreturn msg;",
         "outputs": 1,
         "timeout": 0,
         "noerr": 0,
         "initialize": "",
         "finalize": "",
         "libs": [],
-        "x": 500,
-        "y": 100,
+        "x": 400,
+        "y": 180,
         "wires": [
             [
                 "2e52a7d5dcba1731"
@@ -99,7 +99,7 @@
     {
         "id": "fd3f7169e7cc20e8",
         "type": "inject",
-        "z": "6c5cb5c635f82b56",
+        "z": "d83ba3a0e79165f6",
         "name": "",
         "props": [],
         "repeat": "",
@@ -107,8 +107,8 @@
         "once": false,
         "onceDelay": 0.1,
         "topic": "",
-        "x": 310,
-        "y": 160,
+        "x": 210,
+        "y": 240,
         "wires": [
             [
                 "9b1c32cc48ea5751"
@@ -118,7 +118,7 @@
     {
         "id": "9b1c32cc48ea5751",
         "type": "function",
-        "z": "6c5cb5c635f82b56",
+        "z": "d83ba3a0e79165f6",
         "name": "单独配置",
         "func": "\nmsg.serialPorts = {\n    serialport: '/dev/ttys021',\n    baud: 9600,\n    databits: 8,\n    parity: 'NONE',\n    stopbits: 1\n};\nmsg.queueSend = false;\nreturn msg;",
         "outputs": 1,
@@ -127,8 +127,8 @@
         "initialize": "",
         "finalize": "",
         "libs": [],
-        "x": 480,
-        "y": 160,
+        "x": 380,
+        "y": 240,
         "wires": [
             [
                 "ac7bf7ec36d6a989"
@@ -136,70 +136,12 @@
         ]
     },
     {
-        "id": "b55e31e41cb990b1",
-        "type": "zserial in",
-        "z": "6c5cb5c635f82b56",
-        "name": "统一接收通道",
-        "x": 500,
-        "y": 240,
-        "wires": [
-            [
-                "a4725e6909264fb5"
-            ]
-        ]
-    },
-    {
-        "id": "a4725e6909264fb5",
-        "type": "debug",
-        "z": "6c5cb5c635f82b56",
-        "name": "调试 1",
-        "active": true,
-        "tosidebar": true,
-        "console": false,
-        "tostatus": false,
-        "complete": "true",
-        "targetType": "full",
-        "statusVal": "",
-        "statusType": "auto",
-        "x": 670,
-        "y": 240,
-        "wires": []
-    },
-    {
-        "id": "a6efadadceca633c",
-        "type": "inject",
-        "z": "6c5cb5c635f82b56",
-        "name": "",
-        "props": [],
-        "repeat": "",
-        "crontab": "",
-        "once": false,
-        "onceDelay": "1",
-        "topic": "",
-        "x": 310,
-        "y": 240,
-        "wires": [
-            [
-                "b55e31e41cb990b1"
-            ]
-        ]
-    },
-    {
-        "id": "1bbc5a3a00e0c543",
-        "type": "zserial out",
-        "z": "6c5cb5c635f82b56",
-        "name": "统一发送通道",
-        "x": 860,
-        "y": 140,
-        "wires": []
-    },
-    {
         "id": "cc85519d5a973bd6",
         "type": "zserial request",
-        "z": "6c5cb5c635f82b56",
+        "z": "d83ba3a0e79165f6",
         "name": "发收通道",
-        "x": 840,
-        "y": 200,
+        "x": 740,
+        "y": 240,
         "wires": [
             [
                 "c5b2a60e99954c23"
@@ -209,10 +151,10 @@
     {
         "id": "0e4c242820dcc156",
         "type": "zserial closeAll",
-        "z": "6c5cb5c635f82b56",
+        "z": "d83ba3a0e79165f6",
         "name": "全部关闭",
-        "x": 480,
-        "y": 340,
+        "x": 380,
+        "y": 480,
         "wires": [
             []
         ]
@@ -220,7 +162,7 @@
     {
         "id": "052eea87f99970b0",
         "type": "inject",
-        "z": "6c5cb5c635f82b56",
+        "z": "d83ba3a0e79165f6",
         "name": "",
         "props": [],
         "repeat": "",
@@ -228,8 +170,8 @@
         "once": false,
         "onceDelay": "1",
         "topic": "",
-        "x": 310,
-        "y": 340,
+        "x": 210,
+        "y": 480,
         "wires": [
             [
                 "0e4c242820dcc156"
@@ -239,10 +181,10 @@
     {
         "id": "ef3b251330bafa25",
         "type": "zserial closeAll",
-        "z": "6c5cb5c635f82b56",
+        "z": "d83ba3a0e79165f6",
         "name": "单独关闭",
-        "x": 640,
-        "y": 400,
+        "x": 540,
+        "y": 540,
         "wires": [
             []
         ]
@@ -250,7 +192,7 @@
     {
         "id": "98f8acd5d825b6dd",
         "type": "inject",
-        "z": "6c5cb5c635f82b56",
+        "z": "d83ba3a0e79165f6",
         "name": "",
         "props": [],
         "repeat": "",
@@ -258,8 +200,8 @@
         "once": false,
         "onceDelay": "1",
         "topic": "",
-        "x": 310,
-        "y": 400,
+        "x": 210,
+        "y": 540,
         "wires": [
             [
                 "48f42e1d3e51dd37"
@@ -269,7 +211,7 @@
     {
         "id": "48f42e1d3e51dd37",
         "type": "function",
-        "z": "6c5cb5c635f82b56",
+        "z": "d83ba3a0e79165f6",
         "name": "单独配置",
         "func": "\nmsg.serialConfig = {\n    serialport: '/dev/ttys021',\n    baud: 9600,\n    databits: 8,\n    parity: 'NONE',\n    stopbits: 1\n};\nreturn msg;",
         "outputs": 1,
@@ -278,11 +220,186 @@
         "initialize": "",
         "finalize": "",
         "libs": [],
-        "x": 480,
-        "y": 400,
+        "x": 380,
+        "y": 540,
         "wires": [
             [
                 "ef3b251330bafa25"
+            ]
+        ]
+    },
+    {
+        "id": "de1ba17b88689674",
+        "type": "debug",
+        "z": "d83ba3a0e79165f6",
+        "name": "调试 4",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "true",
+        "targetType": "full",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 730,
+        "y": 180,
+        "wires": []
+    },
+    {
+        "id": "e2a9ce8197332b37",
+        "type": "zserial batch",
+        "z": "d83ba3a0e79165f6",
+        "name": "批量发收",
+        "x": 580,
+        "y": 400,
+        "wires": [
+            [
+                "4bb8ea3e0f7356c4"
+            ],
+            [
+                "fb3429149bdb670e"
+            ],
+            [
+                "0b7d2e09c81f4b21"
+            ]
+        ]
+    },
+    {
+        "id": "24569a0782518192",
+        "type": "inject",
+        "z": "d83ba3a0e79165f6",
+        "name": "",
+        "props": [],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "x": 210,
+        "y": 400,
+        "wires": [
+            [
+                "8cc9a6e4d6656909"
+            ]
+        ]
+    },
+    {
+        "id": "8cc9a6e4d6656909",
+        "type": "function",
+        "z": "d83ba3a0e79165f6",
+        "name": "窗口配置数组",
+        "func": "let serialPorts = [\n    {\n        serialport:'/dev/ttys022',\n        baud:9600,\n        databits:8,\n        parity:'NONE',\n        stopbits:1,\n        responsetimeout:12000,\n        payload:'ttys022\\n'\n    },\n    {\n        serialport: '/dev/ttys026',\n        baud: 9600,\n        databits: 8,\n        parity: 'NONE',\n        stopbits: 1,\n        responsetimeout:15000,\n        payload:'ttys026\\n'\n    },\n    \n];\nmsg.flush=false;\nmsg.serialConfigs=serialPorts;\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 400,
+        "y": 400,
+        "wires": [
+            [
+                "e2a9ce8197332b37"
+            ]
+        ]
+    },
+    {
+        "id": "4bb8ea3e0f7356c4",
+        "type": "debug",
+        "z": "d83ba3a0e79165f6",
+        "name": "////////////调试 8",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "true",
+        "targetType": "full",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 840,
+        "y": 360,
+        "wires": []
+    },
+    {
+        "id": "fb3429149bdb670e",
+        "type": "debug",
+        "z": "d83ba3a0e79165f6",
+        "name": "调试 8",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "true",
+        "targetType": "full",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 830,
+        "y": 400,
+        "wires": []
+    },
+    {
+        "id": "0b7d2e09c81f4b21",
+        "type": "debug",
+        "z": "d83ba3a0e79165f6",
+        "name": "++++++调试 9",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "true",
+        "targetType": "full",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 840,
+        "y": 440,
+        "wires": []
+    },
+    {
+        "id": "ce72b12d1101e66b",
+        "type": "zserial in",
+        "z": "d83ba3a0e79165f6",
+        "name": "统一接收通道",
+        "x": 400,
+        "y": 300,
+        "wires": [
+            [
+                "3e8f4e282ee7f980"
+            ]
+        ]
+    },
+    {
+        "id": "3e8f4e282ee7f980",
+        "type": "debug",
+        "z": "d83ba3a0e79165f6",
+        "name": "调试 9",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "true",
+        "targetType": "full",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 570,
+        "y": 300,
+        "wires": []
+    },
+    {
+        "id": "0215791db4d97215",
+        "type": "inject",
+        "z": "d83ba3a0e79165f6",
+        "name": "",
+        "props": [],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": "1",
+        "topic": "",
+        "x": 210,
+        "y": 300,
+        "wires": [
+            [
+                "ce72b12d1101e66b"
             ]
         ]
     }
