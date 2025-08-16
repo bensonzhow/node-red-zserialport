@@ -1,7 +1,10 @@
-node-zserialport
+node-zserial port
 ========================
 
+
+
 <a href="http://nodered.org" target="noderedinfo">Node-RED</a> 节点，用于与硬件串口通信。
+
 ![node-red-zserialport](images/demo.png)
 
 ## 安装
