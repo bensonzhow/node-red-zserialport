@@ -46,6 +46,7 @@ module.exports = function (RED) {
                 node.error('msg.serialConfig 没有定义,已创建更新波特率使用 msg.baudrate');
                 msg.status = "NO_SERIAL_CONFIG";
                 node.send(msg);
+                done();
                 return;
             }
             let curPort = serialPool.get(msg.serialConfig);
@@ -64,6 +65,7 @@ module.exports = function (RED) {
             }
             if (!msg.hasOwnProperty("payload")) {
                 node.warn(RED._("serial.errors.nopayload"));
+                done();
                 return;
             } // do nothing unless we have a payload
 
@@ -75,6 +77,7 @@ module.exports = function (RED) {
                     if (err) {
                         node.error(err);
                     }
+                    done();
                 });
             } else {
                 var payload = curPort.encodePayload(msg.payload);
@@ -85,6 +88,7 @@ module.exports = function (RED) {
                     } else {
                         msg.status = "OK";
                     }
+                    done();
                 });
             }
         }
@@ -93,7 +97,6 @@ module.exports = function (RED) {
             let curPort = serialPool.get(msg.serialConfig);
             // 确保只绑定一次事件
             if (curPort._isBindOnOutEventInit) {
-                // if (done) done();
                 return;
             }
             curPort._isBindOnOutEventInit = true;
@@ -122,7 +125,8 @@ module.exports = function (RED) {
         RED.nodes.createNode(this, n);
         var node = this;
         function onMsg(msg, send, done) {
-            setCallback();
+            setCallback(msg, send, done);
+            done();
         }
 
         this.on("input", function (msg, send, done) {
@@ -135,7 +139,7 @@ module.exports = function (RED) {
             return { conns, connKeys }
         }
 
-        function setCallback() {
+        function setCallback(msg, send, done) {
             let { conns, connKeys } = getConnection();
             // node.warn(connKeys);
             node.status({ fill: "green", shape: "dot", text: "当前连接数：" + connKeys.length });
@@ -207,6 +211,7 @@ module.exports = function (RED) {
 
             if (!msg.serialConfig) {
                 node.error('msg.serialConfig 没有定义,已创建更新波特率使用 msg.baudrate');
+                done();
                 return;
             }
             let curPort = serialPool.get(msg.serialConfig);
@@ -224,7 +229,10 @@ module.exports = function (RED) {
                     });
                 }
             }
-            if (!msg.hasOwnProperty("payload")) { return; } // do nothing unless we have a payload
+            if (!msg.hasOwnProperty("payload")) {
+                done();
+                return;
+            } // do nothing unless we have a payload
             if (msg.hasOwnProperty("count") && (typeof msg.count === "number") && (msg.serialConfig.out === "count")) {
                 msg.serialConfig.newline = msg.count;
             }
@@ -244,7 +252,6 @@ module.exports = function (RED) {
             let curPort = serialPool.get(msg.serialConfig);
             // 确保只绑定一次事件
             if (curPort._isBindEventInit) {
-                // if (done) done();
                 return;
             }
             // node.warn("setCallback called for " + curPort.serial.path);
@@ -257,20 +264,21 @@ module.exports = function (RED) {
                 node.status({ fill: "green", shape: "dot", text: "ok:::" + curPort.serial.path });
                 msgout.status = "OK";
                 node.send(msgout);
-                // if (done) done();
+                if (done) done();
             });
             curPort.on('timeout', function (msgout, sender) {
                 if (sender !== node) { return; }
                 msgout.status = "ERR_TIMEOUT";
                 node.status({ fill: "red", shape: "ring", text: "timeout:::" + curPort.serial.path });
                 node.send(msgout);
-                // if (done) done();
+                if (done) done();
             });
             curPort.on('ready', function () {
                 node.status({ fill: "green", shape: "dot", text: "connected:::" + curPort.serial.path });
             });
             curPort.on('closed', function () {
                 node.status({ fill: "red", shape: "ring", text: "not-connected:::" + curPort.serial.path });
+                if (done) done();
             });
             curPort.on('stopped', function () {
                 node.status({ fill: "grey", shape: "ring", text: "stopped:::" + curPort.serial.path });
@@ -299,33 +307,25 @@ module.exports = function (RED) {
         node.totalMsg = {};
         node.successMsg = {};
         node.errorMsg = {};
-        function zsend(msg, err, alldone, port) {
+        node._msg = null
+        function zsend(msg, err, alldone, port, done) {
 
+            let payload = msg || err;
+            node._msg.payload = payload;
+            node.totalMsg[port] = payload
             if (msg) {
-                node.successMsg[port] = {
-                    msg: msg,
-                }
+                node.successMsg[port] = msg
+                node.send([node._msg, null, null]);
             }
             if (err) {
-                node.errorMsg[port] = {
-                    err: err,
-                }
+                node.errorMsg[port] = err
+                node.send([null, node._msg, null]);
             }
-            if (node.totalMsg[port]) {
-                node.totalMsg[port] = Object.assign(node.totalMsg[port], {
-                    msg: msg || err,
-                })
-            } else {
-                node.totalMsg[port] = {
-                    msg: msg || err,
-                }
-            }
-
-            node.send([msg, err, alldone]);
-            sendAll();
+            sendAll(done);
 
         }
         function onMsg(msg, send, done) {
+            node._msg = msg;
             if (!msg.serialConfigs) {
                 node.error("需要配置批量配置：msg.serialConfigs");
                 // zsend(msg, null, null)
@@ -336,29 +336,31 @@ module.exports = function (RED) {
             for (var i = 0; i < msg.serialConfigs.length; i++) {
                 var serialConfig = msg.serialConfigs[i];
                 serialConfig._msgid = msg._msgid + "_" + i;
-                // totalMsg[serialConfig.serialport] = {
-                //     serialConfig: serialConfig,
-                // };
-                getSerialServer(msg, serialConfig);
+                getSerialServer(msg, serialConfig, done);
             }
         }
 
-        function sendAll() {
+        function sendAll(done) {
             try {
                 let len = Object.keys(node.totalMsg).length;
                 if (len == node.totallenth) {
-                    node.send([null, null, {
+                    let payload = {
                         totalMsg: node.totalMsg,
                         successMsg: node.successMsg,
                         errorMsg: node.errorMsg,
-                    }]);
+                    }
+                    node.send([null, null,Object.assign({}, node._msg,{
+                        payload: payload
+                    })]);
+                    done()
                 }
             } catch (error) {
                 node.error(error);
+                done()
             }
 
         }
-        function getSerialServer(msg, serialConfig) {
+        function getSerialServer(msg, serialConfig, done) {
             let curPort = serialPool.get(serialConfig);
 
             if (msg.hasOwnProperty("baudrate")) {
@@ -366,9 +368,8 @@ module.exports = function (RED) {
                 if (isNaN(baud)) {
                     // node.error(RED._("serial.errors.badbaudrate"), msg);
                     zsend(null, {
-                        msg: msg,
                         text: RED._("serial.errors.badbaudrate")
-                    }, null, curPort.serial.path)
+                    }, null, curPort.serial.path, done)
                 } else {
                     curPort.update({ baudRate: baud }, function (err, res) {
                         if (err) {
@@ -378,16 +379,15 @@ module.exports = function (RED) {
                                 status: "ERR_UPDATE",
                                 error: err,
                                 text: "更新波特率失败"
-                            }, null, curPort.serial.path)
+                            }, null, curPort.serial.path, done)
                         }
                     });
                 }
             }
             if (!serialConfig.hasOwnProperty("payload")) {
                 zsend(null, {
-                    msg: msg,
                     text: "No payload"
-                }, null, curPort.serial.path)
+                }, null, curPort.serial.path, done)
                 return;
             } // do nothing unless we have a payload
             if (msg.hasOwnProperty("count") && (typeof msg.count === "number") && (serialConfig.out === "count")) {
@@ -395,9 +395,7 @@ module.exports = function (RED) {
             }
             if (msg.hasOwnProperty("flush") && msg.flush === true) { curPort.serial.flush(); }
 
-            setCallback(msg, serialConfig, function (err, res) {
-
-            });
+            setCallback(msg, serialConfig, done);
             // msg.payload = serialConfig.payload;
             setTimeout(function () {
                 try {
@@ -418,9 +416,9 @@ module.exports = function (RED) {
                         curPort._retryNum = 0
                         zsend(null, {
                             status: "ERR_IN_QUEUE",
-                            msg: '串口未打开，加入消息队列失败',
+                            text: '串口未打开，加入消息队列失败',
                             port: curPort.serial.path
-                        }, null, curPort.serial.path);
+                        }, null, curPort.serial.path, done);
                     }
                 } catch (error) {
                     node.error(error);
@@ -443,7 +441,7 @@ module.exports = function (RED) {
             curPort.on('data', function (msgout, sender) {
                 if (sender !== node) { return; }
                 msgout.status = "OK";
-                zsend(msgout, null, null, curPort.serial.path);
+                zsend(msgout, null, null, curPort.serial.path, done);
             });
             curPort.on('timeout', function (msgout, sender) {
                 if (sender !== node) { return; }
@@ -451,9 +449,8 @@ module.exports = function (RED) {
                 node.status({ fill: "red", shape: "ring", text: "timeout:::" + curPort.serial.path });
                 zsend(null, {
                     status: "ERR_TIMEOUT",
-                    msg: msgout,
                     port: curPort.serial.path
-                }, null, curPort.serial.path);
+                }, null, curPort.serial.path, done);
             });
 
             curPort.on('initerror', function (port, retryNum, olderr) {
@@ -462,7 +459,7 @@ module.exports = function (RED) {
                     text: `请检查端口是否打开,重试次数${retryNum}`,
                     error: olderr,
                     port: port
-                }, null, curPort.serial.path);
+                }, null, curPort.serial.path, done);
             });
 
 
@@ -472,7 +469,7 @@ module.exports = function (RED) {
                     status: "ERR_retry",
                     text: `重试${retryNum}失败`,
                     port: port
-                }, null, curPort.serial.path);
+                }, null, curPort.serial.path, done);
             });
 
             curPort.on('closed', function (port) {
