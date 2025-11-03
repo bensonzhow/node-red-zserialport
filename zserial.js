@@ -935,42 +935,47 @@ module.exports = function (RED) {
                             return { ok: false };
                         }
 
-                        // 698（68-LEN 变体）：68 LL LH C ... DATA ... CS 16 ；兼容 FE* 前导
+                        // 698（68-LEN 变体）：68 LL LH C ... DATA ... FCS(2) 16 ；兼容 FE* 前导
                         function tryParse698Len(input) {
-                            // 剥 FE 前导
+                            // 剥离前导 FE
                             const b = stripFE(input);
                             if (b.length < 6 || b[0] !== 0x68) return { ok: false };
-                            // 避免把 645 误判成 698-LEN
+                            // 避免把 645 错误识别为 698-LEN（645 在 b[7] 处固定为 0x68）
                             if (b.length >= 8 && b[7] === 0x68) return { ok: false };
 
-                            // 在缓冲里寻找候选的 0x16 作为帧尾（支持一包多帧/脏数据）
-                            let end = b.indexOf(0x16, 5);
-                            while (end !== -1) {
-                                // —— ① 先试 2 字节 CRC-16/X.25（低字节在前），计算区间：从 LL 开始到 CRC 前一字节 —— 
-                                if (end >= 3) {
-                                    const lo = b[end - 2], hi = b[end - 1];
-                                    const fcs = (hi << 8) | lo;
-                                    const calc = crc16x25(b, /*start=*/1, /*end=*/end - 2); // [LL..CRC-1]
-                                    if (calc === fcs) {
-                                        return { ok: true, used: end + 1, frame: b.slice(0, end + 1) };
-                                    }
-                                }
+                            // ---- 严格按长度域 L 判帧 ----
+                            const LL = b[1] >>> 0;
+                            const LH = b[2] >>> 0;
+                            let Lraw = (LH << 8) | LL; // 含单位位、保留位
+                            const isKB = (Lraw & 0x4000) !== 0;      // bit14：单位位（0=字节，1=KB）
+                            Lraw &= 0x3FFF;                          // 清除单位位与保留位，仅保留长度值
 
-                                // —— ② 再试 1 字节和校验（sum8），计算区间：从 control 起到 CS 前 —— 
-                                if (end >= 2) {
-                                    const cs = b[end - 1];
-                                    const sum = sum8(b, /*start=*/3, /*end=*/end - 1);
-                                    if (cs === sum) {
-                                        return { ok: true, used: end + 1, frame: b.slice(0, end + 1) };
-                                    }
-                                }
+                            // 仅支持常见“字节”为单位的场景；若为 KB 单位，展开至字节
+                            let L = isKB ? (Lraw << 10) : Lraw;      // KB -> *1024
 
-                                // 找下一个 0x16
-                                end = b.indexOf(0x16, end + 1);
+                            // 期望 0x16 的位置（相对 b 的起点）：1 + L
+                            const expectedEnd = 1 + L;
+                            // 缓冲区数据还不够，继续累计
+                            if (b.length < expectedEnd + 1) return { ok: false };
+                            // 不是以 0x16 结尾，说明前面有脏字节或起点错位，丢弃 1 字节继续
+                            if (b[expectedEnd] !== 0x16) {
+                                return { ok: false, used: 1, frame: b.slice(0, 1), err: "698_LEN_BAD_END" };
                             }
 
-                            // 还不能定论，继续累计字节
-                            return { ok: false };
+                            // FCS 校验（CRC‑16/X.25），计算区间：[LL..FCS 前一字节]
+                            const fcsLo = b[expectedEnd - 2];
+                            const fcsHi = b[expectedEnd - 1];
+                            const fcs = (fcsHi << 8) | fcsLo;
+                            const calc = crc16x25(b, 1, expectedEnd - 2);
+                            if (calc !== fcs) {
+                                return { ok: false, used: 1, frame: b.slice(0, 1), err: "698_LEN_FCS_FAIL" };
+                            }
+
+                            // （可选）HCS 校验：从 LL 开始至 HCS 前一字节
+                            // 按 698.45，HCS 位于地址域之后；为避免复杂度，这里不强制校验 HCS。
+                            // 仅在需要时可补：解析地址域长度后再计算 HCS。
+
+                            return { ok: true, used: expectedEnd + 1, frame: b.slice(0, expectedEnd + 1) };
                         }
 
                         // 698（HDLC）：7E ... [FCS(lo,hi)] 7E，支持 0x7D 转义与 X.25 FCS
