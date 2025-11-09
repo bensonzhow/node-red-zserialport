@@ -1,6 +1,6 @@
 {
     "name": "node-zserial",
-    "version": "1.0.23",
+    "version": "1.0.24",
     "description": "Node-RED nodes to talk to serial ports",
     "dependencies": {
         "serialport": "^12.0.0"

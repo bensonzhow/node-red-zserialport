@@ -24,7 +24,7 @@ module.exports = function (RED) {
                     node.send(msg);
                     done();
                 }, node);
-            } 
+            }
             else if (msg.serialConfigs) {
                 let allLen = msg.serialConfigs.length;
                 let total = msg.serialConfigs.length;
@@ -329,7 +329,7 @@ module.exports = function (RED) {
         node.successMsg = {};
         node.errorMsg = {};
         node._msg = null
-
+        
         function initMsg(msg) {
             node._msg = msg;
             node.totallenth = msg.serialConfigs.length;
@@ -338,7 +338,7 @@ module.exports = function (RED) {
             node.errorMsg = {};
         }
         function zsend(msg, err, alldone, port, done) {
-
+            
             let payload = msg || err;
             node._msg.payload = payload;
             node.totalMsg[port] = payload
@@ -358,7 +358,6 @@ module.exports = function (RED) {
             sendAll(done);
         }
         function onMsg(msg, send, done) {
-
             initMsg(msg);
             if (!msg.serialConfigs) {
                 node.error("需要配置批量配置：msg.serialConfigs");
@@ -370,14 +369,14 @@ module.exports = function (RED) {
             for (var i = 0; i < msg.serialConfigs.length; i++) {
                 var serialConfig = msg.serialConfigs[i];
                 serialConfig._msgid = msg._msgid + "_" + i;
-                getSerialServer(msg, serialConfig, done);
+                getSerialServer( msg, serialConfig, done);
             }
         }
 
         function sendAll(done) {
+            
             try {
                 let len = Object.keys(node.totalMsg).length;
-
                 if (len == node.totallenth) {
                     let payload = {
                         totalMsg: node.totalMsg,
@@ -501,53 +500,82 @@ module.exports = function (RED) {
 
         }
 
+        function isCurNode(msgout, curMsg, _ndoe, sender) {
+            // if (sender == node) { return true; }
+            if (msgout.request_msgid && msgout.request_msgid.startsWith(curMsg._msgid)) {
+                return true
+            }
+            return false
+        }
+
         function setCallback(msg, serialConfig, done) {
             let curPort = serialPool.get(serialConfig);
-            // 确保只绑定一次事件
-            if (curPort._isBindEventInit) {
+            // 确保当前节点只绑定一次事件
+            // if (curPort._isBindEventInit) {
+            //     return;
+            // }
+            // node.warn("setCallback called for " + curPort.serial.path);
+            // curPort._isBindEventInit = true;
+
+            if (node[`_dataHandler_${curPort.serial.path}`]) {
                 return;
             }
-            // node.warn("setCallback called for " + curPort.serial.path);
-            curPort._isBindEventInit = true;
-
-            curPort.on('data', function (msgout, sender) {
+            const dataHandler = function (msgout, sender) {
                 if (sender !== node) { return; }
-                msgout.status = "OK";
-                zsend(msgout, null, null, curPort.serial.path, done);
-            });
-            curPort.on('timeout', function (msgout, sender) {
+                try {
+                    msgout.status = "OK";
+                    zsend(msgout, null, null, curPort.serial.path, done);
+                } catch (error) {
+                    node.error(error)
+                }
+
+            }
+
+            const timeoutHandler = function (msgout, sender) {
                 if (sender !== node) { return; }
                 msgout.status = "ERR_TIMEOUT";
                 msgout.port = curPort.serial.path;
                 node.status({ fill: "red", shape: "ring", text: "timeout:::" + curPort.serial.path });
                 zsend(null, msgout, null, curPort.serial.path, done);
-            });
+            }
 
-            curPort.on('initerror', function (port, retryNum, olderr) {
-                // zsend(null, {
-                //     status: "ERR_INIT",
-                //     text: `请检查端口是否打开,重试次数${retryNum}`,
-                //     error: olderr,
-                //     port: port
-                // }, null, curPort.serial.path, done);
-            });
+            node[`_dataHandler_${curPort.serial.path}`] = dataHandler
+            node[`_timeoutHandler_${curPort.serial.path}`] = timeoutHandler
+            curPort.on('data', dataHandler);
+            curPort.on('timeout', timeoutHandler);
+
+            node.on('close', function () {
+                node[`_dataHandler_${curPort.serial.path}`] = null
+                node[`_timeoutHandler_${curPort.serial.path}`] = null
+                curPort.off('data', dataHandler);
+                curPort.off('timeout', timeoutHandler);
+            })
+
+            // curPort.on('initerror', function (port, retryNum, olderr) {
+            //     // zsend(null, {
+            //     //     status: "ERR_INIT",
+            //     //     text: `请检查端口是否打开,重试次数${retryNum}`,
+            //     //     error: olderr,
+            //     //     port: port
+            //     // }, null, curPort.serial.path, done);
+            // });
 
 
-            curPort.on('retryerror', function (port, retryNum) {
-                // curPort._retryNum = 0;
-                // zsend(null, {
-                //     status: "ERR_retry",
-                //     text: `重试${retryNum}失败`,
-                //     port: port
-                // }, null, curPort.serial.path, done);
-            });
+            // curPort.on('retryerror', function (port, retryNum) {
+            //     // curPort._retryNum = 0;
+            //     // zsend(null, {
+            //     //     status: "ERR_retry",
+            //     //     text: `重试${retryNum}失败`,
+            //     //     port: port
+            //     // }, null, curPort.serial.path, done);
+            // });
 
-            curPort.on('closed', function (port) {
-                // node.warn(`串口已关闭:${port}`);
-            });
-            curPort.on('ready', function (port) {
-                // node.warn(`串口已准备好:${port}`);
-            });
+            // curPort.on('closed', function (port) {
+            //     // node.warn(`串口已关闭:${port}`);
+            // });
+            // curPort.on('ready', function (port) {
+            //     // node.warn(`串口已准备好:${port}`);
+            // });
         }
 
         this.on("input", function (msg, send, done) {
@@ -876,6 +904,47 @@ module.exports = function (RED) {
                             return Buffer.from(out);
                         }
 
+
+                        // GNW 蓝牙帧：7E 7E 7E 5A  ...  CS  7E A5
+                        function tryParseBleGNW(input) {
+                            const b = input;
+                            if (b.length < 9) return { ok: false };                   // 最短：4起始 + 1LEN + 1CMD + 0DATA + 1CS + 2结束
+                            // 形态判定：必须以 7E 7E 7E 5A 开头
+                            if (!(b[0] === 0x7E && b[1] === 0x7E && b[2] === 0x7E && b[3] === 0x5A)) {
+                                // 若不是，看看后面是否有候选起点（容错脏字节）
+                                const n = b.indexOf(0x7E);
+                                if (n > 0) return { ok: false, used: n, frame: b.slice(0, n), err: "BLE_NO_7E7E7E5A_AT_START" };
+                                return { ok: false };
+                            }
+
+                            // 向后找结束 A5，要求倒数第二个字节是 0x7E（结束符 7E A5）
+                            let endPos = -1;
+                            for (let i = 5; i < b.length; i++) {
+                                if (b[i] === 0xA5 && b[i - 1] === 0x7E) { endPos = i; break; }
+                            }
+                            if (endPos === -1) return { ok: false };                  // 半包，继续累计
+
+                            const frame = b.slice(0, endPos + 1);                     // [0 .. A5]
+                            // 基本字段位置：len 在 [4]，cmd 在 [5]，CS 在倒数第3个字节
+                            const L = frame[4] >>> 0;
+                            const cs = frame[frame.length - 3] >>> 0;
+
+                            // （宽松）长度一致性：实测总长 T 与 L 的关系为 T = L + 3
+                            const T = frame.length;
+                            if ((T - 3) !== L) {
+                                // 不强制失败，给出“长度不一致”的错误帧提示并丢掉该段，避免卡死
+                                return { ok: false, used: frame.length, frame, err: "BLE_LEN_MISMATCH" };
+                            }
+
+                            // 和校验：从起始 0x7E 到 CS 之前所有字节累加低8位
+                            let sum = 0;
+                            for (let i = 0; i < frame.length - 3; i++) sum = (sum + (frame[i] >>> 0)) & 0xFF;
+                            if (sum !== cs) {
+                                return { ok: false, used: frame.length, frame, err: "BLE_CS_FAIL" };
+                            }
+
+                            return { ok: true, used: frame.length, frame };
+                        }
                         // 645：FE* 68 + 6 addr + 68 + ctrl + len + data + cs + 16
                         function tryParse645(input) {
                             // 统计 FE 前导（仅用于 used，不参与 CS 计算）
@@ -1026,8 +1095,14 @@ module.exports = function (RED) {
 
                             // 抽帧
                             while (assembleBuf.length >= 5) {
-                                // 优先 HDLC，再 645，再 698-Len（避免误判）
-                                let r = tryParse698HDLC(assembleBuf);
+                                // // 优先 HDLC，再 645，再 698-Len（避免误判）
+                                // let r = tryParse698HDLC(assembleBuf);
+                                // if (!r.ok) r = tryParse645(assembleBuf);
+                                // if (!r.ok) r = tryParse698Len(assembleBuf);
+
+                                // --fix-20251108-先 BLE（7E7E7E5A…7EA5），再 698-HDLC，再 645，再 698-LEN
+                                let r = tryParseBleGNW(assembleBuf);
+                                if (!r.ok) r = tryParse698HDLC(assembleBuf);
                                 if (!r.ok) r = tryParse645(assembleBuf);
                                 if (!r.ok) r = tryParse698Len(assembleBuf);
 
