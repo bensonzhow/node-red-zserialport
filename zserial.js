@@ -550,36 +550,19 @@ module.exports = function (RED) {
                 curPort.off('data', dataHandler);
                 curPort.off('timeout', timeoutHandler);
             })
+        }
 
-            // curPort.on('initerror', function (port, retryNum, olderr) {
-            //     // zsend(null, {
-            //     //     status: "ERR_INIT",
-            //     //     text: `请检查端口是否打开,重试次数${retryNum}`,
-            //     //     error: olderr,
-            //     //     port: port
-            //     // }, null, curPort.serial.path, done);
-            // });
+        function afterClosed(port){
+            node[`_dataHandler_${port}`] = null
+            node[`_timeoutHandler_${port}`] = null
+        }
 
-
-            // curPort.on('retryerror', function (port, retryNum) {
-            //     // curPort._retryNum = 0;
-            //     // zsend(null, {
-            //     //     status: "ERR_retry",
-            //     //     text: `重试${retryNum}失败`,
-            //     //     port: port
-            //     // }, null, curPort.serial.path, done);
-            // });
-
-            // curPort.on('closed', function (port) {
-            //     // node.warn(`串口已关闭:${port}`);
-            // });
-            // curPort.on('ready', function (port) {
-            //     // node.warn(`串口已准备好:${port}`);
-            // });
+        if(!node._afterClosed){
+            node._afterClosed = afterClosed;
+            serialPool.on('afterClosed', node._afterClosed);
         }
 
         this.on("input", function (msg, send, done) {
-
             onMsg(msg, send, done);
         })
         this.on("close", function (done) {
@@ -587,7 +570,9 @@ module.exports = function (RED) {
             node.successMsg = null;
             node.errorMsg = null;
             try {
+                serialPool.off('afterClosed', node._afterClosed);
                 serialPool.closeAll(done, node);
+                node._afterClosed = null;
             } catch (error) {
                 done();
             }
@@ -1248,6 +1233,7 @@ module.exports = function (RED) {
                     try {
                         connections[port].close(function () {
                             serialPool.zlog(node, "关闭成功");
+                            _zemitter.emit('afterClosed', port);
                             RED.log.info(RED._("serial.errors.closed", { port: port }), {});
                             done();
                         });
