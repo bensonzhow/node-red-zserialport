@@ -586,7 +586,7 @@ module.exports = function (RED) {
     var serialPool = (function () {
         var connections = {};
         var _zemitter = new events.EventEmitter();
-
+        _zemitter.setMaxListeners(500); // 设置最大监听器数量为500，防止警告
         return {
             on: function (event, callback) { _zemitter.on(event, callback); },
             off: function (event, callback) { _zemitter.off(event, callback); },
