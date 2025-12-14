@@ -956,17 +956,42 @@ module.exports = function (RED) {
                             const endIdx = total - 1;                  // 末尾 0x16 索引
                             const csIdx = total - 2;                  // ★ CS 在倒数第2个字节
 
-                            // CS = 从第一个 0x68 起累加到 CS 之前（不含 CS）
+                            // CS 双模校验：
+                            //  - full：从第一个 0x68 起累加到 CS 前（不含 CS）
+                            //  - std ：从第二个 0x68 后（C+L+DATA）累加到 CS 前
                             const csOK = (end) => {
-                                const e = end;              // e == total
-                                const cs = b[e - 2];         // csIdx
-                                const s = sum8(b, 0, e - 2);
-                                return cs === s;
+                                const e = end;               // e == total
+                                const cs = b[e - 2];         // CS 在倒数第2字节
+
+                                // full 模式
+                                const sFull = sum8(b, 0, e - 2);
+                                if (cs === sFull) return { ok: true, mode: 'full', calc: sFull };
+
+                                // std 模式（需确保第二个 0x68 存在于固定位置7）
+                                if (b.length >= 10 && b[7] === 0x68) {
+                                    // 第二个 0x68 后开始：CTRL(8) + LEN(9) + DATA...
+                                    const sStd = sum8(b, 8, e - 2);
+                                    if (cs === sStd) return { ok: true, mode: 'std', calc: sStd };
+                                    return { ok: false, mode: 'std', calc: sStd, calc_full: sFull };
+                                }
+                                return { ok: false, mode: 'full', calc: sFull };
                             };
 
                             // 1) 优先按 LEN 快速命中
-                            if (b.length >= total && b[endIdx] === 0x16 && csOK(total)) {
-                                return { ok: true, used: feCount + total, frame: input.slice(0, feCount + total) };
+                            if (b.length >= total && b[endIdx] === 0x16) {
+                                const ck = csOK(total);
+                                if (ck && ck.ok) {
+                                    const frame = input.slice(0, feCount + total);
+                                    // 透出校验模式，便于排障：部分设备使用 std 模式
+                                    try {
+                                        frame._meta = Object.assign({}, frame._meta || {}, {
+                                            proto: '645',
+                                            cs_mode: ck.mode,
+                                            cs_calc: ck.calc
+                                        });
+                                    } catch (e) { }
+                                    return { ok: true, used: feCount + total, frame };
+                                }
                             }
 
                             // 2) 回溯：向后找 0x16 做候选结尾，再校验 CS（兼容异常 LEN/粘包）
@@ -974,10 +999,17 @@ module.exports = function (RED) {
                                 if (b[end - 1] !== 0x16) continue;
                                 // 候选帧至少要有 …… + CS + 16，因此 end >= 13 且 csIdx=end-2 >= 0
                                 if (end >= 13) {
-                                    const cs = b[end - 2];
-                                    const s = sum8(b, 0, end - 2);
-                                    if (cs === s) {
-                                        return { ok: true, used: feCount + end, frame: input.slice(0, feCount + end) };
+                                    const ck = csOK(end);
+                                    if (ck && ck.ok) {
+                                        const frame = input.slice(0, feCount + end);
+                                        try {
+                                            frame._meta = Object.assign({}, frame._meta || {}, {
+                                                proto: '645',
+                                                cs_mode: ck.mode,
+                                                cs_calc: ck.calc
+                                            });
+                                        } catch (e) { }
+                                        return { ok: true, used: feCount + end, frame };
                                     }
                                 }
                             }
@@ -994,9 +1026,6 @@ module.exports = function (RED) {
                             // 剥离前导 FE
                             const b = stripFE(input);
                             if (b.length < 6 || b[0] !== 0x68) return { ok: false };
-                            // 避免把 645 错误识别为 698-LEN（645 在 b[7] 处固定为 0x68）
-                            if (b.length >= 8 && b[7] === 0x68) return { ok: false };
-
                             // ---- 严格按长度域 L 判帧 ----
                             const LL = b[1] >>> 0;
                             const LH = b[2] >>> 0;
@@ -1016,20 +1045,43 @@ module.exports = function (RED) {
                                 return { ok: false, used: 1, frame: b.slice(0, 1), err: "698_LEN_BAD_END" };
                             }
 
-                            // FCS 校验（CRC‑16/X.25），计算区间：[LL..FCS 前一字节]
+                            // FCS 校验（CRC‑16/X.25），FCS 在 0x16 前两字节（低字节在前）
+                            // 不同设备实现存在“覆盖起点差异”：
+                            //  - 常见实现A：从 0x68 开始到 FCS 前（不含FCS与16）
+                            //  - 常见实现B：从长度域(LL)开始到 FCS 前
                             const fcsLo = b[expectedEnd - 2];
                             const fcsHi = b[expectedEnd - 1];
                             const fcs = (fcsHi << 8) | fcsLo;
-                            const calc = crc16x25(b, 1, expectedEnd - 2);
-                            if (calc !== fcs) {
-                                return { ok: false, used: 1, frame: b.slice(0, 1), err: "698_LEN_FCS_FAIL" };
+
+                            const calcA = crc16x25(b, 0, expectedEnd - 2); // 覆盖 [0 .. FCS前)
+                            const calcB = crc16x25(b, 1, expectedEnd - 2); // 覆盖 [LL .. FCS前)
+                            const fcsOK = (calcA === fcs) || (calcB === fcs);
+
+                            // 重要：即便 FCS 不通过，也返回“可截帧”的结果，避免被 645 误判卡死
+                            // 上层可通过 msgout.fcs_ok / reason 做告警与进一步排查
+                            if (!fcsOK) {
+                                return {
+                                    ok: true,
+                                    used: expectedEnd + 1,
+                                    frame: b.slice(0, expectedEnd + 1),
+                                    fcs_ok: false,
+                                    fcs_frame: fcs,
+                                    fcs_calc_a: calcA,
+                                    fcs_calc_b: calcB,
+                                    err: "698_LEN_FCS_FAIL"
+                                };
                             }
 
                             // （可选）HCS 校验：从 LL 开始至 HCS 前一字节
                             // 按 698.45，HCS 位于地址域之后；为避免复杂度，这里不强制校验 HCS。
                             // 仅在需要时可补：解析地址域长度后再计算 HCS。
 
-                            return { ok: true, used: expectedEnd + 1, frame: b.slice(0, expectedEnd + 1) };
+                            return {
+                                ok: true,
+                                used: expectedEnd + 1,
+                                frame: b.slice(0, expectedEnd + 1),
+                                fcs_ok: true
+                            };
                         }
 
                         // 698（HDLC）：7E ... [FCS(lo,hi)] 7E，支持 0x7D 转义与 X.25 FCS
@@ -1085,13 +1137,29 @@ module.exports = function (RED) {
                                 // if (!r.ok) r = tryParse645(assembleBuf);
                                 // if (!r.ok) r = tryParse698Len(assembleBuf);
 
-                                // --fix-20251108-先 BLE（7E7E7E5A…7EA5），再 698-HDLC，再 645，再 698-LEN
+                                // --fix-20251213-先 BLE（7E7E7E5A…7EA5），再 698-HDLC，再 698-LEN，再 645
+                                // 关键：698-LEN 必须优先于 645，否则遇到 698 帧内出现 0x68（如示例报文第7字节）会被 645 误判并卡住
                                 let r = tryParseBleGNW(assembleBuf);
                                 if (!r.ok) r = tryParse698HDLC(assembleBuf);
-                                if (!r.ok) r = tryParse645(assembleBuf);
                                 if (!r.ok) r = tryParse698Len(assembleBuf);
+                                if (!r.ok) r = tryParse645(assembleBuf);
 
                                 if (r.ok) {
+                                    // 附加解析元数据（例如 698 FCS 校验结果），供上层排障
+                                    if (r && typeof r === 'object') {
+                                        try {
+                                            r.frame._meta = {
+                                                proto: r.proto || undefined,
+                                                fcs_ok: (typeof r.fcs_ok === 'boolean') ? r.fcs_ok : undefined,
+                                                err: r.err || undefined,
+                                                fcs_frame: r.fcs_frame,
+                                                fcs_calc_a: r.fcs_calc_a,
+                                                fcs_calc_b: r.fcs_calc_b
+                                            };
+                                        } catch (e) {
+                                            // ignore
+                                        }
+                                    }
                                     emitOk(r.frame);
                                     assembleBuf = assembleBuf.slice(r.used);
                                     continue;
@@ -1138,6 +1206,14 @@ module.exports = function (RED) {
                                         msgout.payload = m;
                                         msgout.port = port;
                                         msgout.status = "OK";
+
+                                        // 若解析器附带了元数据（例如 698 FCS 校验结果），一并输出
+                                        if (frameBuf && frameBuf._meta) {
+                                            msgout.frame_meta = frameBuf._meta;
+                                            // 便于后续 GC：避免 assembleBuf 长期引用
+                                            try { delete frameBuf._meta; } catch (e) { }
+                                        }
+
                                         obj._emitter.emit('data', msgout, last_sender);
                                     },
                                     // 错误帧（已有边界但校验/结束符不通过）
