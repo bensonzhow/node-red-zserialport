@@ -1023,45 +1023,79 @@ module.exports = function (RED) {
 
                         // 698（68-LEN 变体）：68 LL LH C ... DATA ... FCS(2) 16 ；兼容 FE* 前导
                         function tryParse698Len(input) {
-                            // 剥离前导 FE
+                            // 剥离前导 FE（注意：这里只做 698-LEN 侧的兼容；645 另有自己的 FE 处理）
                             const b = stripFE(input);
                             if (b.length < 6 || b[0] !== 0x68) return { ok: false };
-                            // ---- 严格按长度域 L 判帧 ----
+
+                            // ---- 读取长度域 ----
+                            // 68 [LL] [LH] [C] ... [FCS(lo)] [FCS(hi)] 16
                             const LL = b[1] >>> 0;
                             const LH = b[2] >>> 0;
-                            let Lraw = (LH << 8) | LL; // 含单位位、保留位
-                            const isKB = (Lraw & 0x4000) !== 0;      // bit14：单位位（0=字节，1=KB）
-                            Lraw &= 0x3FFF;                          // 清除单位位与保留位，仅保留长度值
 
-                            // 仅支持常见“字节”为单位的场景；若为 KB 单位，展开至字节
-                            let L = isKB ? (Lraw << 10) : Lraw;      // KB -> *1024
+                            // Lraw 含单位位/保留位：bit14 为单位位（0=字节，1=KB）
+                            let Lraw = (LH << 8) | LL;
+                            const isKB = (Lraw & 0x4000) !== 0;
+                            Lraw &= 0x3FFF; // 清掉单位位/保留位，只留下数值
 
-                            // 期望 0x16 的位置（相对 b 的起点）：1 + L
+                            // 绝大多数场景长度单位为“字节”；若遇到 KB 单位则折算
+                            const L = isKB ? (Lraw << 10) : Lraw; // KB -> *1024
+
+                            // ------------------------ 关键防误判（核心修复点） ------------------------
+                            // 误判根因：645 帧形态为 68 + 6字节地址 + 68 ...，地址字节中“偶然出现 0x16”
+                            // 例如：68 02 80 16 00 00 00 68 ...
+                            // 若把 LL=0x02、LH=0x80 解读为 698-LEN 长度，则 L=2，expectedEnd=3，b[3]=0x16
+                            // 从而被 698-LEN 误判为 “68 02 80 16” 一帧，导致吞掉 645 的帧头并产生残片。
+
+                            // 约束 1：698-LEN 的 L 不可能极短（至少应包含：C + 头字段 + FCS(2)）
+                            // 这里给经验下限 6（偏保守，既能挡住 L=2，又尽量不误伤极端设备）
+                            // 若现场仍有碰撞，可把下限提高到 8 或 10（建议先保留 6）。
+                            const MIN_698_LEN_L = 6;
+                            if (L < MIN_698_LEN_L) {
+                                // 不消费任何字节，让后续 parser（如 645）继续尝试
+                                return { ok: false };
+                            }
+
+                            // 约束 2：控制域 C 在 b[3]，不可能是 0x16（结束符）
+                            // 若 b[3] == 0x16，几乎必然是 645 地址域碰撞导致的误判
+                            if (b.length >= 4 && b[3] === 0x16) {
+                                return { ok: false };
+                            }
+                            // ------------------------------------------------------------------------
+
+                            // 期望 0x16 的位置（相对 b 起点）：1 + L
+                            // 解释：L 表示从 LL 开始到 FCS(含) 之前的长度？各厂实现略有差异
+                            // 你现有逻辑采用 expectedEnd = 1 + L，并要求 b[expectedEnd] == 0x16
                             const expectedEnd = 1 + L;
-                            // 缓冲区数据还不够，继续累计
+
+                            // 半包：继续累积
                             if (b.length < expectedEnd + 1) return { ok: false };
-                            // 不是以 0x16 结尾，说明前面有脏字节或起点错位，丢弃 1 字节继续
+
+                            // 若 expectedEnd 位置不是 0x16，说明起点错位或存在脏字节
+                            // 这里消费 1 字节，避免死循环卡住
                             if (b[expectedEnd] !== 0x16) {
                                 return { ok: false, used: 1, frame: b.slice(0, 1), err: "698_LEN_BAD_END" };
                             }
 
-                            // FCS 校验（CRC‑16/X.25），FCS 在 0x16 前两字节（低字节在前）
-                            // 不同设备实现存在“覆盖起点差异”：
-                            //  - 常见实现A：从 0x68 开始到 FCS 前（不含FCS与16）
-                            //  - 常见实现B：从长度域(LL)开始到 FCS 前
+                            // ------------------------ FCS 校验（CRC-16/X.25） ------------------------
+                            // FCS 位于 0x16 前两字节，低字节在前（lo, hi）
+                            if (expectedEnd - 2 < 0) return { ok: false };
+
                             const fcsLo = b[expectedEnd - 2];
                             const fcsHi = b[expectedEnd - 1];
                             const fcs = (fcsHi << 8) | fcsLo;
 
-                            const calcA = crc16x25(b, 0, expectedEnd - 2); // 覆盖 [0 .. FCS前)
-                            const calcB = crc16x25(b, 1, expectedEnd - 2); // 覆盖 [LL .. FCS前)
+                            // 不同实现对“CRC 覆盖范围”存在差异，常见两种：
+                            // A) 从 0x68 开始算到 FCS 前（不含 FCS 与 0x16）
+                            // B) 从 LL 开始算到 FCS 前（不含 FCS 与 0x16）
+                            const calcA = crc16x25(b, 0, expectedEnd - 2);
+                            const calcB = crc16x25(b, 1, expectedEnd - 2);
                             const fcsOK = (calcA === fcs) || (calcB === fcs);
 
-                            // 重要：即便 FCS 不通过，也返回“可截帧”的结果，避免被 645 误判卡死
-                            // 上层可通过 msgout.fcs_ok / reason 做告警与进一步排查
+                            // 注意：FCS 不通过时不能返回 ok:true（否则会“强制截帧”吞掉其它协议帧）
+                            // 但为了防止卡死，这里仍消费掉该段，并作为错误帧上报给 emitErr。
                             if (!fcsOK) {
                                 return {
-                                    ok: true,
+                                    ok: false,
                                     used: expectedEnd + 1,
                                     frame: b.slice(0, expectedEnd + 1),
                                     fcs_ok: false,
@@ -1072,10 +1106,7 @@ module.exports = function (RED) {
                                 };
                             }
 
-                            // （可选）HCS 校验：从 LL 开始至 HCS 前一字节
-                            // 按 698.45，HCS 位于地址域之后；为避免复杂度，这里不强制校验 HCS。
-                            // 仅在需要时可补：解析地址域长度后再计算 HCS。
-
+                            // FCS 通过：返回完整帧（含 0x68..0x16）
                             return {
                                 ok: true,
                                 used: expectedEnd + 1,
@@ -1165,7 +1196,33 @@ module.exports = function (RED) {
                                     continue;
                                 }
                                 if (r.used) {
-                                    emitErr(r.frame, r.err || "FRAME_INVALID");
+                                    // 如果 parser 返回了“可消费”的错误帧（例如 698-LEN FCS_FAIL），
+                                    // 这里把诊断信息写入 frame._meta，供上层日志/排障使用。
+                                    if (r && typeof r === 'object') {
+                                        try {
+                                            if (r.frame) {
+                                                // 统一把元数据挂到 frame 上，避免引用未定义变量导致运行期异常
+                                                r.frame._meta = Object.assign({}, r.frame._meta || {}, {
+                                                    // proto：用于上层区分到底是 645 / 698-hdlc / 698-len / ble 等
+                                                    proto: (r.fcs_ok === false) ? '698-len' : (r.proto || undefined),
+                                                    // FCS 校验信息（仅当 698-LEN 校验失败时有意义）
+                                                    fcs_ok: (typeof r.fcs_ok === 'boolean') ? r.fcs_ok : undefined,
+                                                    fcs_frame: r.fcs_frame,
+                                                    fcs_calc_a: r.fcs_calc_a,
+                                                    fcs_calc_b: r.fcs_calc_b,
+                                                    // err：更精确的错误原因
+                                                    err: r.err || "FRAME_INVALID"
+                                                });
+                                            }
+                                        } catch (e) {
+                                            // ignore：不要因为诊断信息影响主流程
+                                        }
+                                    }
+
+                                    // 错误帧统一走 emitErr，reason 以 r.err 为准
+                                    emitErr(r.frame, (r && r.err) ? r.err : "FRAME_INVALID");
+
+                                    // 消费掉该段，防止 assembleBuf 卡死
                                     assembleBuf = assembleBuf.slice(r.used);
                                     continue;
                                 }
