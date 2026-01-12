@@ -1161,6 +1161,53 @@ module.exports = function (RED) {
                                 assembleBuf = assembleBuf.slice(k);
                             }
 
+                            // 若缓存以 0x68 开始但迟迟无法凑齐完整帧，且中途出现新一轮 0xFE 0xFE 0xFE 0xFE 前导，
+                            // 说明上一帧很可能被截断/丢字节（现场常见：串口/转换器插入前导或上层超时提前取走）。
+                            // 这种情况下必须“强制丢弃”残片并从新的 FE 前导重新同步，否则会一直卡住导致后续帧都解析不出来。
+                            function findFeRun4(buf) {
+                                // 查找连续 4 个 0xFE 的起始位置
+                                for (let i = 0; i <= buf.length - 4; i++) {
+                                    if (buf[i] === 0xFE && buf[i + 1] === 0xFE && buf[i + 2] === 0xFE && buf[i + 3] === 0xFE) return i;
+                                }
+                                return -1;
+                            }
+
+                            // 仅对 698-LEN（0x68...0x16）这种“依赖长度域”的帧做强制重同步处理
+                            if (assembleBuf.length >= 4 && assembleBuf[0] === 0x68) {
+                                const LL0 = assembleBuf[1] >>> 0;
+                                const LH0 = assembleBuf[2] >>> 0;
+                                let Lraw0 = (LH0 << 8) | LL0;
+                                const isKB0 = (Lraw0 & 0x4000) !== 0;
+                                Lraw0 &= 0x3FFF;
+                                const L0 = isKB0 ? (Lraw0 << 10) : Lraw0;
+                                const expectedEnd0 = 1 + L0;
+
+                                // 只有在“明显是长帧但当前数据不足”时才触发该策略
+                                if (L0 >= 6 && assembleBuf.length < expectedEnd0 + 1) {
+                                    const fePos = findFeRun4(assembleBuf);
+                                    if (fePos > 0) {
+                                        // fePos 之前的内容属于上一帧残片，作为错误帧上报并丢弃；
+                                        // 然后保留从 FE 开始的内容，留给下一轮解析。
+                                        const bad = assembleBuf.slice(0, fePos);
+                                        emitErr(Buffer.from(bad), "FRAME_TRUNCATED_RESYNC_FE");
+                                        assembleBuf = assembleBuf.slice(fePos);
+
+                                        // 重新执行一次前导剔噪/FE 剥离（与上面逻辑一致）
+                                        let ss = 0;
+                                        while (ss < assembleBuf.length) {
+                                            const cc = assembleBuf[ss];
+                                            if (cc === 0xFE || cc === 0x68 || cc === 0x7E) break;
+                                            ss++;
+                                        }
+                                        if (ss > 0) assembleBuf = assembleBuf.slice(ss);
+                                        if (assembleBuf.length && assembleBuf[0] === 0xFE) {
+                                            let kk = 0; while (kk < assembleBuf.length && assembleBuf[kk] === 0xFE) kk++;
+                                            assembleBuf = assembleBuf.slice(kk);
+                                        }
+                                    }
+                                }
+                            }
+
                             // 抽帧
                             while (assembleBuf.length >= 5) {
                                 // // 优先 HDLC，再 645，再 698-Len（避免误判）
@@ -1255,12 +1302,14 @@ module.exports = function (RED) {
                                     d,
                                     // 完整 OK 帧
                                     function (frameBuf) {
+                                        // frame 模式下，务必保持 Buffer 原样输出（避免 0x00 等字节在字符串链路中被截断/损坏）
+                                        // 同时附带 payload_hex 便于日志/排障。
                                         var m = Buffer.from(frameBuf);
                                         var last_sender = null;
                                         if (obj.queue.length) { last_sender = obj.queue[0].sender; }
                                         var msgout = obj.dequeue() || {};
-                                        if (binoutput !== "bin") { m = m.toString(); }
                                         msgout.payload = m;
+                                        msgout.payload_hex = m.toString('hex').toUpperCase();
                                         msgout.port = port;
                                         msgout.status = "OK";
 
@@ -1275,12 +1324,13 @@ module.exports = function (RED) {
                                     },
                                     // 错误帧（已有边界但校验/结束符不通过）
                                     function (badBuf, reason) {
+                                        // 错误帧同样保持 Buffer 输出，并提供 HEX 字符串，便于定位截断点/前导位置
                                         var m = Buffer.from(badBuf);
                                         var last_sender = null;
                                         if (obj.queue.length) { last_sender = obj.queue[0].sender; }
                                         var msgout = obj.dequeue() || {};
-                                        if (binoutput !== "bin") { m = m.toString(); }
                                         msgout.payload = m;
+                                        msgout.payload_hex = m.toString('hex').toUpperCase();
                                         msgout.port = port;
                                         msgout.status = "ERR_FRAME";
                                         msgout.reason = reason || "FRAME_INVALID";
