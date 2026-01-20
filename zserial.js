@@ -1,4 +1,8 @@
 
+/**
+ * 
+ * version: 1.0.34
+ */
 module.exports = function (RED) {
     /*jshint -W082 */
     "use strict";
@@ -655,6 +659,11 @@ module.exports = function (RED) {
                         _retryNum: 0,
                         tout: null,
                         queue: [],
+                        // ---- 防重复推进：同一次 serial 'data' 回调只允许 dequeue 一次 ----
+                        _rxToken: 0,
+                        _rxDequeuedToken: -1,
+                        // ---- 发送序号：用于标记本次 writehead 的队首请求 ----
+                        _txSeq: 0,
                         on: function (a, b) { this._emitter.on(a, b); },
                         once: function (a, b) { this._emitter.once(a, b); },
                         close: function (cb) {
@@ -700,11 +709,23 @@ module.exports = function (RED) {
                         writehead: function () {
                             if (!this.queue.length) { return; }
                             var qobj = this.queue[0];
+                            // 标记本次发送的队首请求（用于防止 timeout 与接收回包边界竞态导致双推进）
+                            qobj._done = false;
+                            qobj._txId = (++obj._txSeq);
                             this.write(qobj.payload, qobj.cb);
                             var msg = qobj.msg;
                             var timeout = msg.timeout || responsetimeout;
                             this.tout = setTimeout(function () {
-                                this.tout = null;
+                                // 注意：回调内 this 不是 obj，统一使用 obj.tout
+                                obj.tout = null;
+
+                                // 关键保护：timeout 触发时，只允许处理“仍然挂在队首的同一个 qobj”。
+                                // 若队列已因正常回包 dequeue 推进，则该 timeout 已失效，直接忽略，避免连续发送/错位。
+                                if (!obj.queue || !obj.queue.length) { return; }
+                                if (obj.queue[0] !== qobj) { return; }
+                                if (qobj._done) { return; }
+                                qobj._done = true;
+
                                 var msgout = obj.dequeue() || {};
                                 msgout.port = id;
                                 // // if we have some leftover stuff, just send it
@@ -755,16 +776,33 @@ module.exports = function (RED) {
                             // if we are trying to dequeue stuff from an
                             // empty queue, that's an unsolicited message
                             if (!this.queue.length) { return null; }
-                            var msg = Object.assign({}, this.queue[0].msg);
+
+                            // 关键保护：同一次 serial 'data' 回调（同 _rxToken）内只允许 dequeue 一次。
+                            // 防止 frame 自动解析在同一批输入字节上被多协议/多分支误判两次，导致队列被推进两次（连续发送）。
+                            if (typeof this._rxToken === 'number' && this._rxDequeuedToken === this._rxToken) {
+                                return null;
+                            }
+                            if (typeof this._rxToken === 'number') {
+                                this._rxDequeuedToken = this._rxToken;
+                            }
+
+                            // 出队前标记 done：用于 timeout 回调校验
+                            var qobj = this.queue[0];
+                            if (qobj && qobj._done !== true) { qobj._done = true; }
+
+                            var msg = Object.assign({}, qobj.msg);
                             msg = Object.assign(msg, {
                                 request_payload: msg.payload,
                                 request_msgid: msg._msgid,
                             });
                             delete msg.payload;
-                            if (this.tout) {
+
+                            // 取消当前请求的响应超时计时器
+                            if (obj.tout) {
                                 clearTimeout(obj.tout);
                                 obj.tout = null;
                             }
+
                             this.queue.shift();
                             this.writehead();
                             return msg;
@@ -1280,6 +1318,8 @@ module.exports = function (RED) {
 
 
                         obj.serial.on('data', function (d) {
+                            // 标记本次接收事件 token（用于防止同一次 data 回调内重复 dequeue 推进队列）
+                            obj._rxToken = (obj._rxToken || 0) + 1;
                             // RED.log.info("data::::" + d);
                             function emitData(data) {
                                 if (active === true) {
