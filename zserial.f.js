@@ -473,7 +473,8 @@ module.exports = function (RED) {
                     curPort.enqueue(serialConfig, node, function (err, res) {
                         if (err) { node.error(err); }
                     }, function (queue) {
-                        // 队列开始发送（可选日志）
+                        // node.warn("队列开始发送::");
+                        // node.warn(queue);
                     });
                 } catch (error) {
                     node.error(error);
@@ -715,7 +716,7 @@ module.exports = function (RED) {
                                 // 注意：回调内 this 不是 obj，统一使用 obj.tout
                                 obj.tout = null;
 
-                                // 关键保护：timeout 触发时，只允许处理“仍然挂在队首的同一个 qobj”。
+                                // 关键保护：timeout 触发时，只允许处理"仍然挂在队首的同一个 qobj"。
                                 // 若队列已因正常回包 dequeue 推进，则该 timeout 已失效，直接忽略，避免连续发送/错位。
                                 if (!obj.queue || !obj.queue.length) { return; }
                                 if (obj.queue[0] !== qobj) { return; }
@@ -768,23 +769,35 @@ module.exports = function (RED) {
                                 obj._emitter.emit('timeout', msgout, qobj.sender);
                             }, timeout);
                         },
-                        dequeue: function () {
-                            // if we are trying to dequeue stuff from an
-                            // empty queue, that's an unsolicited message
+                        dequeue: function (specificIndex) {
+                            // 如果队列为空，返回null
                             if (!this.queue.length) { return null; }
-
-                            // 关键保护：同一次 serial 'data' 回调（同 _rxToken）内只允许 dequeue 一次。
-                            // 防止 frame 自动解析在同一批输入字节上被多协议/多分支误判两次，导致队列被推进两次（连续发送）。
-                            if (typeof this._rxToken === 'number' && this._rxDequeuedToken === this._rxToken) {
+                            
+                            var qobj;
+                            var targetIndex = specificIndex !== undefined ? specificIndex : 0;
+                            
+                            // 检查索引是否有效
+                            if (targetIndex < 0 || targetIndex >= this.queue.length) {
                                 return null;
                             }
-                            if (typeof this._rxToken === 'number') {
-                                this._rxDequeuedToken = this._rxToken;
+                            
+                            // 关键保护：同一次 serial 'data' 回调（同 _rxToken）内只允许 dequeue 一次（除非指定了特定索引）。
+                            if (specificIndex === undefined) {
+                                if (typeof this._rxToken === 'number' && this._rxDequeuedToken === this._rxToken) {
+                                    return null;
+                                }
+                                if (typeof this._rxToken === 'number') {
+                                    this._rxDequeuedToken = this._rxToken;
+                                }
                             }
 
-                            // 出队前标记 done：用于 timeout 回调校验
-                            var qobj = this.queue[0];
-                            if (qobj && qobj._done !== true) { qobj._done = true; }
+                            // 获取目标对象
+                            qobj = this.queue[targetIndex];
+                            
+                            // 标记为已完成
+                            if (qobj && qobj._done !== true) { 
+                                qobj._done = true; 
+                            }
 
                             var msg = Object.assign({}, qobj.msg);
                             msg = Object.assign(msg, {
@@ -793,16 +806,153 @@ module.exports = function (RED) {
                             });
                             delete msg.payload;
 
-                            // 取消当前请求的响应超时计时器
-                            if (obj.tout) {
+                            // 从队列中删除指定索引的元素
+                            this.queue.splice(targetIndex, 1);
+                            
+                            // 如果删除的是队首元素，取消当前请求的响应超时计时器
+                            if (targetIndex === 0 && obj.tout) {
                                 clearTimeout(obj.tout);
                                 obj.tout = null;
                             }
-
-                            this.queue.shift();
-                            this.writehead();
+                            
+                            // 如果删除的是队首元素且队列不为空，启动下一个请求
+                            if (targetIndex === 0 && this.queue.length > 0) {
+                                this.writehead();
+                            }
+                            
                             return msg;
                         },
+                        // 添加验证和匹配方法
+                        findMatchingRequest: function(responseBuffer) {
+                            if (!responseBuffer || !Array.isArray(this.queue) || this.queue.length === 0) {
+                                return -1;
+                            }
+                            
+                            // 遍历队列寻找匹配的请求
+                            for (let i = 0; i < this.queue.length; i++) {
+                                const request = this.queue[i];
+                                if (this.validateResponse(request.msg, responseBuffer)) {
+                                    return i; // 返回匹配项的索引
+                                }
+                            }
+                            
+                            // 如果没有找到匹配项，返回-1
+                            return -1;
+                        },
+                        
+                        validateResponse: function(requestMsg, responseBuffer) {
+                            if (!requestMsg || !responseBuffer) {
+                                return false;
+                            }
+                            
+                            // 如果请求中包含特定的命令标识，尝试验证响应是否匹配
+                            if (requestMsg.payload && Buffer.isBuffer(requestMsg.payload)) {
+                                // 对于DL/T645协议，可以根据控制码和功能码来判断响应是否匹配
+                                var requestBuf = requestMsg.payload;
+                                
+                                // DL/T645协议解析逻辑
+                                // 检查请求帧结构：FE* + 68 + 地址(6) + 68 + 控制码 + 长度 + 数据 + CS + 16
+                                var reqCtrlCode = this.findCtrlCodeInRequest(requestBuf);
+                                var respCtrlCode = this.findCtrlCodeInResponse(responseBuffer);
+                                
+                                // 如果是读操作，响应的控制码应该是请求控制码+0x80
+                                if (reqCtrlCode !== null && respCtrlCode !== null) {
+                                    if (reqCtrlCode === 0x11 && respCtrlCode === 0x91) { // 读数据
+                                        // 进一步验证地址是否匹配
+                                        var reqAddr = this.extractAddress(requestBuf);
+                                        var respAddr = this.extractAddress(responseBuffer);
+                                        
+                                        if (reqAddr && respAddr) {
+                                            return reqAddr.equals(respAddr);
+                                        }
+                                        // 如果地址不可用，至少确认控制码匹配
+                                        return true;
+                                    }
+                                }
+                                
+                                // 可以进一步添加更详细的验证逻辑
+                                // 比如比较地址、数据标识符等
+                                var reqAddr = this.extractAddress(requestBuf);
+                                var respAddr = this.extractAddress(responseBuffer);
+                                
+                                if (reqAddr && respAddr) {
+                                    return reqAddr.equals(respAddr);
+                                }
+                            }
+                            
+                            // 默认返回false，确保只有真正的匹配才会返回true
+                            return false;
+                        },
+                        
+                        // 提取控制码的辅助函数
+                        findCtrlCodeInRequest: function(buffer) {
+                            if (!buffer || buffer.length < 8) return null;
+                            
+                            // 寻找68开头的位置
+                            var pos = -1;
+                            for (var i = 0; i < buffer.length - 7; i++) {
+                                if (buffer[i] === 0x68) {
+                                    // 检查是否是第二个68
+                                    if (i + 7 < buffer.length && buffer[i + 7] === 0x68) {
+                                        pos = i + 7; // 第二个68的位置
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            if (pos > -1 && pos + 1 < buffer.length) {
+                                return buffer[pos + 1]; // 控制码在第二个68后
+                            }
+                            
+                            return null;
+                        },
+                        
+                        // 提取响应控制码的辅助函数
+                        findCtrlCodeInResponse: function(buffer) {
+                            if (!buffer || buffer.length < 8) return null;
+                            
+                            // 寻找68开头的位置
+                            var pos = -1;
+                            for (var i = 0; i < buffer.length - 7; i++) {
+                                if (buffer[i] === 0x68) {
+                                    // 检查是否是第二个68
+                                    if (i + 7 < buffer.length && buffer[i + 7] === 0x68) {
+                                        pos = i + 7; // 第二个68的位置
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            if (pos > -1 && pos + 1 < buffer.length) {
+                                return buffer[pos + 1]; // 控制码在第二个68后
+                            }
+                            
+                            return null;
+                        },
+                        
+                        // 提取地址的辅助函数
+                        extractAddress: function(buffer) {
+                            if (!buffer || buffer.length < 7) return null;
+                            
+                            // 寻找第一个68的位置
+                            var pos = -1;
+                            for (var i = 0; i < buffer.length - 6; i++) {
+                                if (buffer[i] === 0x68) {
+                                    // 确认后面跟着6个字节的地址和第二个68
+                                    if (i + 6 < buffer.length && buffer[i + 7] === 0x68) {
+                                        pos = i;
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            if (pos > -1) {
+                                // 地址在第一个68后
+                                return buffer.slice(pos + 1, pos + 7);
+                            }
+                            
+                            return null;
+                        }
                     }
                     //newline = newline.replace("\\n","\n").replace("\\r","\r");
                     obj._emitter.setMaxListeners(500);
@@ -962,7 +1112,7 @@ module.exports = function (RED) {
                             // （宽松）长度一致性：实测总长 T 与 L 的关系为 T = L + 3
                             const T = frame.length;
                             if ((T - 3) !== L) {
-                                // 不强制失败，给出“长度不一致”的错误帧提示并丢掉该段，避免卡死
+                                // 不强制失败，给出"长度不一致"的错误帧提示并丢掉该段，避免卡死
                                 return { ok: false, used: frame.length, frame, err: "BLE_LEN_MISMATCH" };
                             }
 
@@ -1085,14 +1235,14 @@ module.exports = function (RED) {
                             const isKB = (Lraw & 0x4000) !== 0;
                             Lraw &= 0x3FFF; // 清掉单位位/保留位，只留下数值
 
-                            // 绝大多数场景长度单位为“字节”；若遇到 KB 单位则折算
+                            // 绝大多数场景长度单位为"字节"；若遇到 KB 单位则折算
                             const L = isKB ? (Lraw << 10) : Lraw; // KB -> *1024
 
                             // ------------------------ 关键防误判（核心修复点） ------------------------
-                            // 误判根因：645 帧形态为 68 + 6字节地址 + 68 ...，地址字节中“偶然出现 0x16”
+                            // 误判根因：645 帧形态为 68 + 6字节地址 + 68 ...，地址字节中"偶然出现 0x16"
                             // 例如：68 02 80 16 00 00 00 68 ...
                             // 若把 LL=0x02、LH=0x80 解读为 698-LEN 长度，则 L=2，expectedEnd=3，b[3]=0x16
-                            // 从而被 698-LEN 误判为 “68 02 80 16” 一帧，导致吞掉 645 的帧头并产生残片。
+                            // 从而被 698-LEN 误判为 "68 02 80 16" 一帧，导致吞掉 645 的帧头并产生残片。
 
                             // 约束 1：698-LEN 的 L 不可能极短（至少应包含：C + 头字段 + FCS(2)）
                             // 这里给经验下限 6（偏保守，既能挡住 L=2，又尽量不误伤极端设备）
@@ -1149,7 +1299,7 @@ module.exports = function (RED) {
                             const fcsHi = b[expectedEnd - 1];
                             const fcs = (fcsHi << 8) | fcsLo;
 
-                            // 不同实现对“CRC 覆盖范围”存在差异，常见两种：
+                            // 不同实现对"CRC 覆盖范围"存在差异，常见两种：
                             // A) 从 0x68 开始算到 FCS 前（不含 FCS 与 0x16）
                             // B) 从 LL 开始算到 FCS 前（不含 FCS 与 0x16）
                             const calcA = crc16x25(b, 0, expectedEnd - 2);
@@ -1157,8 +1307,8 @@ module.exports = function (RED) {
                             const fcsOK = (calcA === fcs) || (calcB === fcs);
 
                             // 现场经常遇到：帧内容完整（68..16 边界正确），但 FCS 因链路噪声/串口转换器问题偶发不一致。
-                            // 若此处直接判为错误帧并 dequeue，会导致上层“偶尔无法解码”（尤其是请求-响应严格匹配的场景）。
-                            // 因此：当边界与长度域一致时，允许“容错通过”，并在 _meta 中标记 fcs_ok=false 供上层排障。
+                            // 若此处直接判为错误帧并 dequeue，会导致上层"偶尔无法解码"（尤其是请求-响应严格匹配的场景）。
+                            // 因此：当边界与长度域一致时，允许"容错通过"，并在 _meta 中标记 fcs_ok=false 供上层排障。
                             if (!fcsOK) {
                                 return {
                                     ok: false,
@@ -1194,7 +1344,7 @@ module.exports = function (RED) {
                             const payload = unescapeHDLC(payloadEscaped);
                             // if (payload.length < 3) return { ok: false, used: endPos + 1, frame: rawFrame, err: "698_HDLC_TOO_SHORT" };
                             if (payload.length < 3) return { ok: false };
-                            // 严格形态约束：698-HDLC 的“帧格式域”通常以 0xA0/0xA8/0xB0 等开头（高四位为 0xA 或 0xB）。
+                            // 严格形态约束：698-HDLC 的"帧格式域"通常以 0xA0/0xA8/0xB0 等开头（高四位为 0xA 或 0xB）。
                             // 若不满足，极可能只是链路噪声/误同步的 0x7E，不应在 frame 模式下被消费掉（否则会 dequeue 错配）。
                             const fmt = payload[0] >>> 0;
                             const hi = fmt & 0xF0;
@@ -1216,7 +1366,7 @@ module.exports = function (RED) {
                             if (!Buffer.isBuffer(d)) d = Buffer.from(d);
                             assembleBuf = Buffer.concat([assembleBuf, d]);
 
-                            // 修复：部分现场链路/中间层会把原始 8-bit 串口数据“扩展”为 UTF-16LE 形态
+                            // 修复：部分现场链路/中间层会把原始 8-bit 串口数据"扩展"为 UTF-16LE 形态
                             //      （如 0x7E -> 0x7E00 0x7E00...），导致帧头无法识别。
                             //      需要自动识别并还原原始 8-bit 数据。
                             // (已移除 normalizeUtf16Interleave 修复块)
@@ -1234,7 +1384,7 @@ module.exports = function (RED) {
                                 if (!r.ok) r = tryParse698HDLC(assembleBuf);
 
                                 // ---- 兜底：0x7E 起始已形成候选段（存在第二个 0x7E），但 BLE/HDLC 均无法校验通过 -> 丢 1 字节推进重同步 ----
-                                // 仅在候选段“闭合”时执行（有第二个 0x7E），避免误伤半包；并要求 endPos>=5，避免误伤 7E7E/7E7E7E 前导
+                                // 仅在候选段"闭合"时执行（有第二个 0x7E），避免误伤半包；并要求 endPos>=5，避免误伤 7E7E/7E7E7E 前导
                                 if (!r.ok && assembleBuf.length && assembleBuf[0] === 0x7E) {
                                     const endPos = assembleBuf.indexOf(0x7E, 1);
                                     if (endPos >= 5) {
@@ -1272,7 +1422,7 @@ module.exports = function (RED) {
                                     const frameBuf = r.frame ? Buffer.from(r.frame) : null;
                                     const frameLen = frameBuf ? frameBuf.length : 0;
 
-                                    // 判定是否为“仅推进同步点”的消费：
+                                    // 判定是否为"仅推进同步点"的消费：
                                     //  - used == 1 或 frameLen <= 1：典型 drop1
                                     //  - 或 err 属于已知的 resync 类原因
                                     const errCode = (r && r.err) ? String(r.err) : "";
@@ -1284,7 +1434,7 @@ module.exports = function (RED) {
                                         errCode === "645_SECOND_68_NOT_FOUND";
 
                                     if (!isResyncDrop) {
-                                        // 只有“闭合候选帧但校验/结构失败”的情况才上报 ERR_FRAME
+                                        // 只有"闭合候选帧但校验/结构失败"的情况才上报 ERR_FRAME
                                         try {
                                             if (r.frame) {
                                                 r.frame._meta = Object.assign({}, r.frame._meta || {}, {
@@ -1340,30 +1490,44 @@ module.exports = function (RED) {
                                         // frame 模式下，务必保持 Buffer 原样输出（避免 0x00 等字节在字符串链路中被截断/损坏）
                                         // 同时附带 payload_hex 便于日志/排障。
                                         var m = Buffer.from(frameBuf);
-                                        var last_sender = null;
-                                        if (obj.queue.length) { last_sender = obj.queue[0].sender; }
-                                        var msgout = obj.dequeue() || {};
-                                        msgout.payload = m;
-                                        msgout.payload_hex = m.toString('hex').toUpperCase();
-                                        msgout.port = port;
-                                        msgout.status = "OK";
+                                        
+                                        // 查找匹配的请求
+                                        var matchingIndex = obj.findMatchingRequest(m);
+                                        if (matchingIndex >= 0 && matchingIndex < obj.queue.length) {
+                                            // 找到了匹配的请求，直接从队列中取出该请求
+                                            var matchedRequest = obj.queue[matchingIndex];
+                                            var msgout = obj.dequeue(matchingIndex) || {};
+                                            msgout.payload = m;
+                                            msgout.payload_hex = m.toString('hex').toUpperCase();
+                                            msgout.port = port;
+                                            msgout.status = "OK";
 
-                                        // 若解析器附带了元数据（例如 698 FCS 校验结果），一并输出
-                                        if (frameBuf && frameBuf._meta) {
-                                            msgout.frame_meta = frameBuf._meta;
-                                            // 便于后续 GC：避免 assembleBuf 长期引用
-                                            try { delete frameBuf._meta; } catch (e) { }
+                                            // 若解析器附带了元数据（例如 698 FCS 校验结果），一并输出
+                                            if (frameBuf && frameBuf._meta) {
+                                                msgout.frame_meta = frameBuf._meta;
+                                                // 便于后续 GC：避免 assembleBuf 长期引用
+                                                try { delete frameBuf._meta; } catch (e) { }
+                                            }
+
+                                            // 使用匹配请求的发送者
+                                            obj._emitter.emit('data', msgout, matchedRequest.sender);
+                                        } else {
+                                            // 没有找到匹配的请求，当作未请求数据处理
+                                            var msgout = {};
+                                            msgout.payload = m;
+                                            msgout.payload_hex = m.toString('hex').toUpperCase();
+                                            msgout.port = port;
+                                            msgout.status = "UNSOLICITED";
+                                            obj._emitter.emit('data', msgout, null);
                                         }
-
-                                        obj._emitter.emit('data', msgout, last_sender);
                                     },
                                     // 错误帧（已有边界但校验/结束符不通过）
                                     function (badBuf, reason) {
-                                        // 错误帧同样保持 Buffer 输出，并提供 HEX 字符串，便于定位截断点/前导位置
+                                        // 错误帧同样保持 Buffer 原样输出，并提供 HEX 字符串，便于定位截断点/前导位置
                                         var m = Buffer.from(badBuf);
                                         var last_sender = null;
                                         if (obj.queue.length) { last_sender = obj.queue[0].sender; }
-                                        // 关键修复：错误帧（CRC/CS/结尾不符）不应 dequeue，否则会把“请求上下文”弹出队列，导致后续正确回包无法匹配
+                                        // 关键修复：错误帧（CRC/CS/结尾不符）不应 dequeue，否则会把"请求上下文"弹出队列，导致后续正确回包无法匹配
                                         var msgout = (obj.queue && obj.queue.length) ? Object.assign({}, obj.queue[0].msg) : {};
                                         msgout.payload = m;
                                         msgout.payload_hex = m.toString('hex').toUpperCase();
@@ -1371,7 +1535,7 @@ module.exports = function (RED) {
                                         msgout.status = "ERR_FRAME";
                                         msgout.reason = reason || "FRAME_INVALID";
                                         msgout.is_unsolicited = !(obj.queue && obj.queue.length);
-                                        obj._emitter.emit('data', msgout, last_sender);
+                                        obj._emitter.emit('data', last_sender ? msgout : {payload: m, payload_hex: m.toString('hex').toUpperCase(), port: port, status: "UNSOLICITED"}, last_sender);
                                     }
                                 );
                                 return; // 已处理
