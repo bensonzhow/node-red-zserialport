@@ -1,3 +1,4 @@
+
 module.exports = function (RED) {
     /*jshint -W082 */
     "use strict";
@@ -351,8 +352,7 @@ module.exports = function (RED) {
                     err.sendPayload = err.payload;
                     err.payload = ''
                 }
-                let serialConfig = node._msg.serialConfigs.find(sitem=>sitem.serialport==port)
-                node.errorMsg[port] = Object.assign(serialConfig,err)
+                node.errorMsg[port] = err
                 node.send([null, node._msg, null]);
             }
             sendAll(done);
@@ -369,7 +369,7 @@ module.exports = function (RED) {
             for (var i = 0; i < msg.serialConfigs.length; i++) {
                 var serialConfig = msg.serialConfigs[i];
                 serialConfig._msgid = msg._msgid + "_" + i;
-                getSerialServer(msg, serialConfig, done);
+                getSerialServer( msg, serialConfig, done);
             }
         }
 
@@ -552,12 +552,12 @@ module.exports = function (RED) {
             })
         }
 
-        function afterClosed(port) {
+        function afterClosed(port){
             node[`_dataHandler_${port}`] = null
             node[`_timeoutHandler_${port}`] = null
         }
 
-        if (!node._afterClosed) {
+        if(!node._afterClosed){
             node._afterClosed = afterClosed;
             serialPool.on('afterClosed', node._afterClosed);
         }
@@ -645,6 +645,7 @@ module.exports = function (RED) {
                 addchar = addchar.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t").replace("\\e", "\e").replace("\\f", "\f").replace("\\0", "\0"); // jshint ignore:line
 
                 if (addchar.substr(0, 2) == "0x") { addchar = new Buffer.from([addchar]); }
+                let assembleBuf = Buffer.alloc(0);
                 connections[id] = (function () {
                     var obj = {
                         _emitter: new events.EventEmitter(),
@@ -655,11 +656,12 @@ module.exports = function (RED) {
                         _retryNum: 0,
                         tout: null,
                         queue: [],
-                        // ---- 防重复推进：同一次 serial 'data' 回调只允许 dequeue 一次 ----
+                        // 防重复推进：同一次 serial 'data' 回调只允许 dequeue 一次。
                         _rxToken: 0,
                         _rxDequeuedToken: -1,
-                        // ---- 发送序号：用于标记本次 writehead 的队首请求 ----
+                        // 发送序号：用于标记本次 writehead 的队首请求。
                         _txSeq: 0,
+                        _framePending: null,
                         on: function (a, b) { this._emitter.on(a, b); },
                         once: function (a, b) { this._emitter.once(a, b); },
                         close: function (cb) {
@@ -705,24 +707,36 @@ module.exports = function (RED) {
                         writehead: function () {
                             if (!this.queue.length) { return; }
                             var qobj = this.queue[0];
-                            // 标记本次发送的队首请求（用于防止 timeout 与接收回包边界竞态导致双推进）
                             qobj._done = false;
                             qobj._txId = (++obj._txSeq);
                             this.write(qobj.payload, qobj.cb);
                             var msg = qobj.msg;
                             var timeout = msg.timeout || responsetimeout;
-                            this.tout = setTimeout(function () {
-                                // 注意：回调内 this 不是 obj，统一使用 obj.tout
+                            var maxPartialWait = msg.maxPartialWait || serialConfig.maxPartialWait || (timeout * 2);
+                            var scheduleTimeout = function (delay) {
+                                obj.tout = setTimeout(onResponseTimeout, delay);
+                            };
+                            var onResponseTimeout = function () {
                                 obj.tout = null;
 
-                                // 关键保护：timeout 触发时，只允许处理“仍然挂在队首的同一个 qobj”。
-                                // 若队列已因正常回包 dequeue 推进，则该 timeout 已失效，直接忽略，避免连续发送/错位。
+                                // 只处理仍然挂在队首的同一个请求；正常回包已推进队列时，该 timeout 失效。
                                 if (!obj.queue || !obj.queue.length) { return; }
                                 if (obj.queue[0] !== qobj) { return; }
                                 if (qobj._done) { return; }
+
+                                if (spliton === "frame" && obj._framePending && obj._framePending.proto === '698-len') {
+                                    var now = Date.now();
+                                    var startedAt = obj._framePending.since || now;
+                                    var waited = now - startedAt;
+                                    if (waited < maxPartialWait) {
+                                        scheduleTimeout(Math.max(50, Math.min(timeout, maxPartialWait - waited)));
+                                        return;
+                                    }
+                                }
+
                                 qobj._done = true;
 
-                                var msgout = obj.dequeue() || {};
+                                var msgout = obj.dequeue(true) || {};
                                 msgout.port = id;
                                 // // if we have some leftover stuff, just send it
                                 // if (i !== 0) {
@@ -749,8 +763,11 @@ module.exports = function (RED) {
                                 if (m) {
                                     if (spliton === "frame") {
                                         const mbuf = Buffer.from(m);
-                                        msgout.payload = mbuf;
-                                        msgout.payload_hex = mbuf.toString('hex').toUpperCase();
+                                        msgout.partial_payload = mbuf;
+                                        msgout.partial_payload_hex = mbuf.toString('hex').toUpperCase();
+                                        msgout.payload = Buffer.alloc(0);
+                                        msgout.payload_hex = "";
+                                        msgout.reason = "FRAME_TIMEOUT_PARTIAL";
                                     } else {
                                         if (binoutput !== "bin") { m = m.toString(); }
                                         msgout.payload = m;
@@ -764,25 +781,27 @@ module.exports = function (RED) {
                                     }
                                 }
                                 msgout.status = "ERR_TIMEOUT";
+                                obj._framePending = null;
                                 /* Notify the sender that a timeout occurred */
                                 obj._emitter.emit('timeout', msgout, qobj.sender);
-                            }, timeout);
+                            };
+                            scheduleTimeout(timeout);
                         },
-                        dequeue: function () {
+                        dequeue: function (ignoreRxTokenGuard) {
                             // if we are trying to dequeue stuff from an
                             // empty queue, that's an unsolicited message
                             if (!this.queue.length) { return null; }
 
-                            // 关键保护：同一次 serial 'data' 回调（同 _rxToken）内只允许 dequeue 一次。
-                            // 防止 frame 自动解析在同一批输入字节上被多协议/多分支误判两次，导致队列被推进两次（连续发送）。
-                            if (typeof this._rxToken === 'number' && this._rxDequeuedToken === this._rxToken) {
-                                return null;
-                            }
-                            if (typeof this._rxToken === 'number') {
-                                this._rxDequeuedToken = this._rxToken;
+                            // 同一次 serial 'data' 回调内只允许一次出队，避免粘包/误判让队列连续推进。
+                            if (!ignoreRxTokenGuard) {
+                                if (typeof this._rxToken === 'number' && this._rxDequeuedToken === this._rxToken) {
+                                    return null;
+                                }
+                                if (typeof this._rxToken === 'number') {
+                                    this._rxDequeuedToken = this._rxToken;
+                                }
                             }
 
-                            // 出队前标记 done：用于 timeout 回调校验
                             var qobj = this.queue[0];
                             if (qobj && qobj._done !== true) { qobj._done = true; }
 
@@ -792,13 +811,10 @@ module.exports = function (RED) {
                                 request_msgid: msg._msgid,
                             });
                             delete msg.payload;
-
-                            // 取消当前请求的响应超时计时器
                             if (obj.tout) {
                                 clearTimeout(obj.tout);
                                 obj.tout = null;
                             }
-
                             this.queue.shift();
                             this.writehead();
                             return msg;
@@ -992,8 +1008,7 @@ module.exports = function (RED) {
                             if (b.length >= 8 && b[7] !== 0x68) {
                                 const n = b.indexOf(0x68, 1);
                                 if (n > 0) return { ok: false, used: feCount + n, frame: input.slice(0, feCount + n), err: "645_SECOND_68_NOT_FOUND" };
-                                // 已经有足够字节判定形态错误，但又找不到下一个 0x68：同步点错位，丢 1 字节推进
-                                return { ok: false, used: feCount + 1, frame: input.slice(0, feCount + 1), err: "645_BAD_SHAPE_DROP1" };
+                                return { ok: false };
                             }
                             if (b.length < 10) return { ok: false }; // 还缺 CTRL/LEN
 
@@ -1069,10 +1084,8 @@ module.exports = function (RED) {
 
                         // 698（68-LEN 变体）：68 LL LH C ... DATA ... FCS(2) 16 ；兼容 FE* 前导
                         function tryParse698Len(input) {
-                            // 统计 FE 前导（用于 used/frame 回到原始 input）
-                            let feCount = 0;
-                            while (feCount < input.length && input[feCount] === 0xFE) feCount++;
-                            const b = input.slice(feCount);
+                            // 剥离前导 FE（注意：这里只做 698-LEN 侧的兼容；645 另有自己的 FE 处理）
+                            const b = stripFE(input);
                             if (b.length < 6 || b[0] !== 0x68) return { ok: false };
 
                             // ---- 读取长度域 ----
@@ -1103,12 +1116,10 @@ module.exports = function (RED) {
                                 return { ok: false };
                             }
 
-
-                            // 长度上限：防止错位/噪声把 L 解读成极大值导致 assembleBuf 误判为半包长期等待
-                            // 掉电次数等业务回包通常远小于 2KB；超出则高度可疑，丢 1 字节推进重同步
+                            // 长度上限：防止错位/噪声把 L 解读成极大值导致 assembleBuf 长期等待。
                             const MAX_698_LEN_L = 2048;
                             if (L > MAX_698_LEN_L) {
-                                return { ok: false, used: feCount + 1, frame: input.slice(0, feCount + 1), err: "698_LEN_TOO_LARGE" };
+                                return { ok: false, used: 1, frame: input.slice(0, 1), err: "698_LEN_TOO_LARGE" };
                             }
 
                             // 约束 2：控制域 C 在 b[3]，不可能是 0x16（结束符）
@@ -1116,13 +1127,10 @@ module.exports = function (RED) {
                             if (b.length >= 4 && b[3] === 0x16) {
                                 return { ok: false };
                             }
-                            // 约束 3：控制域 C 必须看起来像 698 的控制域（功能码通常为 1=链路管理 或 3=用户数据）
-                            // 目的：避免 645 的地址字节被当成 698 控制域，从而把 645 整帧误判为 698-LEN 候选帧并被消费掉。
-                            // 698 控制域：bit0..bit3 为功能码（1 或 3 最常见）；其他位为 DIR/PRM/分帧/扰码标志。
+                            // 约束 3：控制域功能码应为常见 698 值，避免把其它 0x68 开头数据误当成长 698 半包。
                             const C = b[3] >>> 0;
                             const func = C & 0x0F;
                             if (!(func === 0x01 || func === 0x03)) {
-                                // 不消费任何字节，让 645 解析器继续尝试
                                 return { ok: false };
                             }
                             // ------------------------------------------------------------------------
@@ -1132,13 +1140,22 @@ module.exports = function (RED) {
                             // 你现有逻辑采用 expectedEnd = 1 + L，并要求 b[expectedEnd] == 0x16
                             const expectedEnd = 1 + L;
 
-                            // 半包：继续累积
-                            if (b.length < expectedEnd + 1) return { ok: false };
+                            // 半包：继续累积。这里必须显式告诉主循环“这是 698-LEN 半包”，
+                            // 否则后续 645 parser 会把第一个 0x68 当作错位字节丢掉。
+                            if (b.length < expectedEnd + 1) {
+                                return {
+                                    ok: false,
+                                    pending: true,
+                                    proto: '698-len',
+                                    expected: expectedEnd + 1,
+                                    have: b.length
+                                };
+                            }
 
                             // 若 expectedEnd 位置不是 0x16，说明起点错位或存在脏字节
                             // 这里消费 1 字节，避免死循环卡住
                             if (b[expectedEnd] !== 0x16) {
-                                return { ok: false, used: feCount + 1, frame: input.slice(0, feCount + 1), err: "698_LEN_BAD_END" };
+                                return { ok: false, used: 1, frame: input.slice(0, 1), err: "698_LEN_BAD_END" };
                             }
 
                             // ------------------------ FCS 校验（CRC-16/X.25） ------------------------
@@ -1156,14 +1173,12 @@ module.exports = function (RED) {
                             const calcB = crc16x25(b, 1, expectedEnd - 2);
                             const fcsOK = (calcA === fcs) || (calcB === fcs);
 
-                            // 现场经常遇到：帧内容完整（68..16 边界正确），但 FCS 因链路噪声/串口转换器问题偶发不一致。
-                            // 若此处直接判为错误帧并 dequeue，会导致上层“偶尔无法解码”（尤其是请求-响应严格匹配的场景）。
-                            // 因此：当边界与长度域一致时，允许“容错通过”，并在 _meta 中标记 fcs_ok=false 供上层排障。
+                            // 边界完整但 FCS 不通过时上报错误帧；队首请求继续等待后续正确帧或最终超时。
                             if (!fcsOK) {
                                 return {
                                     ok: false,
-                                    used: feCount + expectedEnd + 1,
-                                    frame: input.slice(0, feCount + expectedEnd + 1),
+                                    used: expectedEnd + 1,
+                                    frame: b.slice(0, expectedEnd + 1),
                                     fcs_ok: false,
                                     fcs_frame: fcs,
                                     fcs_calc_a: calcA,
@@ -1175,8 +1190,8 @@ module.exports = function (RED) {
                             // FCS 通过：返回完整帧（含 0x68..0x16）
                             return {
                                 ok: true,
-                                used: feCount + expectedEnd + 1,
-                                frame: input.slice(0, feCount + expectedEnd + 1),
+                                used: expectedEnd + 1,
+                                frame: b.slice(0, expectedEnd + 1),
                                 fcs_ok: true
                             };
                         }
@@ -1192,34 +1207,40 @@ module.exports = function (RED) {
                             const rawFrame = b.slice(0, endPos + 1);
                             const payloadEscaped = b.slice(1, endPos);     // 去 7E
                             const payload = unescapeHDLC(payloadEscaped);
-                            // if (payload.length < 3) return { ok: false, used: endPos + 1, frame: rawFrame, err: "698_HDLC_TOO_SHORT" };
-                            if (payload.length < 3) return { ok: false };
-                            // 严格形态约束：698-HDLC 的“帧格式域”通常以 0xA0/0xA8/0xB0 等开头（高四位为 0xA 或 0xB）。
-                            // 若不满足，极可能只是链路噪声/误同步的 0x7E，不应在 frame 模式下被消费掉（否则会 dequeue 错配）。
-                            const fmt = payload[0] >>> 0;
-                            const hi = fmt & 0xF0;
-                            if (!(hi === 0xA0 || hi === 0xB0)) {
-                                return { ok: false }; // 不消费，交给 698-LEN/645 再尝试
-                            }
+                            if (payload.length < 3) return { ok: false, used: endPos + 1, frame: rawFrame, err: "698_HDLC_TOO_SHORT" };
                             const fcsLo = payload[payload.length - 2];
                             const fcsHi = payload[payload.length - 1];
                             const fcs = (fcsHi << 8) | fcsLo;
                             const calc = crc16x25(payload, 0, payload.length - 2);
-                            // if (calc !== fcs) return { ok: false, used: endPos + 1, frame: rawFrame, err: "698_HDLC_CRC_FAIL" };
-                            if (calc !== fcs) return { ok: false };
+                            if (calc !== fcs) return { ok: false, used: endPos + 1, frame: rawFrame, err: "698_HDLC_CRC_FAIL" };
                             return { ok: true, used: endPos + 1, frame: rawFrame }; // 原始含 7E
                         }
 
                         // 统一喂入器：抽帧、报错、剔噪
-                        let assembleBuf = Buffer.alloc(0);
                         function feedAndExtract(d, emitOk, emitErr) {
                             if (!Buffer.isBuffer(d)) d = Buffer.from(d);
                             assembleBuf = Buffer.concat([assembleBuf, d]);
 
-                            // 修复：部分现场链路/中间层会把原始 8-bit 串口数据“扩展”为 UTF-16LE 形态
-                            //      （如 0x7E -> 0x7E00 0x7E00...），导致帧头无法识别。
-                            //      需要自动识别并还原原始 8-bit 数据。
-                            // (已移除 normalizeUtf16Interleave 修复块)
+                            // 防溢出
+                            if (assembleBuf.length > bufMaxSize) {
+                                emitErr(Buffer.from(assembleBuf), "BUFFER_OVERFLOW_DROP_OLD");
+                                assembleBuf = Buffer.alloc(0);
+                                obj._framePending = null;
+                                return;
+                            }
+
+                            // 前导剔噪：仅保留以 FE/68/7E 开头；若以 FE 开头，剥离所有 FE 前导
+                            let s = 0;
+                            while (s < assembleBuf.length) {
+                                const c = assembleBuf[s];
+                                if (c === 0xFE || c === 0x68 || c === 0x7E) break;
+                                s++;
+                            }
+                            if (s > 0) assembleBuf = assembleBuf.slice(s);
+                            if (assembleBuf.length && assembleBuf[0] === 0xFE) {
+                                let k = 0; while (k < assembleBuf.length && assembleBuf[k] === 0xFE) k++;
+                                assembleBuf = assembleBuf.slice(k);
+                            }
 
                             // 抽帧
                             while (assembleBuf.length >= 5) {
@@ -1232,21 +1253,17 @@ module.exports = function (RED) {
                                 // 关键：698-LEN 必须优先于 645，否则遇到 698 帧内出现 0x68（如示例报文第7字节）会被 645 误判并卡住
                                 let r = tryParseBleGNW(assembleBuf);
                                 if (!r.ok) r = tryParse698HDLC(assembleBuf);
-
-                                // ---- 兜底：0x7E 起始已形成候选段（存在第二个 0x7E），但 BLE/HDLC 均无法校验通过 -> 丢 1 字节推进重同步 ----
-                                // 仅在候选段“闭合”时执行（有第二个 0x7E），避免误伤半包；并要求 endPos>=5，避免误伤 7E7E/7E7E7E 前导
-                                if (!r.ok && assembleBuf.length && assembleBuf[0] === 0x7E) {
-                                    const endPos = assembleBuf.indexOf(0x7E, 1);
-                                    if (endPos >= 5) {
-                                        r = { ok: false, used: 1, frame: assembleBuf.slice(0, 1), err: "DROP_7E_BADFRAME" };
-                                    }
-                                }
-
-
                                 if (!r.ok) r = tryParse698Len(assembleBuf);
+                                if (!r.ok && r.pending) {
+                                    obj._framePending = Object.assign({}, r, {
+                                        since: (obj._framePending && obj._framePending.proto === r.proto) ? obj._framePending.since : Date.now()
+                                    });
+                                    break;
+                                }
                                 if (!r.ok) r = tryParse645(assembleBuf);
 
                                 if (r.ok) {
+                                    obj._framePending = null;
                                     // 附加解析元数据（例如 698 FCS 校验结果），供上层排障
                                     if (r && typeof r === 'object') {
                                         try {
@@ -1267,14 +1284,10 @@ module.exports = function (RED) {
                                     continue;
                                 }
                                 if (r.used) {
-                                    // resync/drop1 类（通常 used 很小）不应上报 ERR_FRAME，否则会产生大量重复输出
+                                    obj._framePending = null;
                                     const used = r.used >>> 0;
                                     const frameBuf = r.frame ? Buffer.from(r.frame) : null;
                                     const frameLen = frameBuf ? frameBuf.length : 0;
-
-                                    // 判定是否为“仅推进同步点”的消费：
-                                    //  - used == 1 或 frameLen <= 1：典型 drop1
-                                    //  - 或 err 属于已知的 resync 类原因
                                     const errCode = (r && r.err) ? String(r.err) : "";
                                     const isResyncDrop = (used <= 1) || (frameLen <= 1) ||
                                         errCode === "DROP_7E_BADFRAME" ||
@@ -1284,7 +1297,7 @@ module.exports = function (RED) {
                                         errCode === "645_SECOND_68_NOT_FOUND";
 
                                     if (!isResyncDrop) {
-                                        // 只有“闭合候选帧但校验/结构失败”的情况才上报 ERR_FRAME
+                                        obj._framePending = null;
                                         try {
                                             if (r.frame) {
                                                 r.frame._meta = Object.assign({}, r.frame._meta || {}, {
@@ -1297,12 +1310,11 @@ module.exports = function (RED) {
                                                 });
                                             }
                                         } catch (e) {
-                                            // ignore
+                                            // ignore：诊断信息不能影响主流程
                                         }
                                         emitErr(r.frame, errCode || "FRAME_INVALID");
                                     }
 
-                                    // 无论是否上报，都必须消费，防止 assembleBuf 卡死
                                     assembleBuf = assembleBuf.slice(used);
                                     continue;
                                 }
@@ -1314,7 +1326,6 @@ module.exports = function (RED) {
 
 
                         obj.serial.on('data', function (d) {
-                            // 标记本次接收事件 token（用于防止同一次 data 回调内重复 dequeue 推进队列）
                             obj._rxToken = (obj._rxToken || 0) + 1;
                             // RED.log.info("data::::" + d);
                             function emitData(data) {
@@ -1361,17 +1372,15 @@ module.exports = function (RED) {
                                     function (badBuf, reason) {
                                         // 错误帧同样保持 Buffer 输出，并提供 HEX 字符串，便于定位截断点/前导位置
                                         var m = Buffer.from(badBuf);
-                                        var last_sender = null;
-                                        if (obj.queue.length) { last_sender = obj.queue[0].sender; }
-                                        // 关键修复：错误帧（CRC/CS/结尾不符）不应 dequeue，否则会把“请求上下文”弹出队列，导致后续正确回包无法匹配
-                                        var msgout = (obj.queue && obj.queue.length) ? Object.assign({}, obj.queue[0].msg) : {};
+                                        var msgout = {};
                                         msgout.payload = m;
                                         msgout.payload_hex = m.toString('hex').toUpperCase();
                                         msgout.port = port;
                                         msgout.status = "ERR_FRAME";
                                         msgout.reason = reason || "FRAME_INVALID";
                                         msgout.is_unsolicited = !(obj.queue && obj.queue.length);
-                                        obj._emitter.emit('data', msgout, last_sender);
+                                        // 错误帧不绑定请求 sender，也不 dequeue；队首请求继续等完整帧或超时。
+                                        obj._emitter.emit('data', msgout, null);
                                     }
                                 );
                                 return; // 已处理
