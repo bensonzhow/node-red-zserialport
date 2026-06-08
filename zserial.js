@@ -1101,6 +1101,16 @@ module.exports = function (RED) {
                             // 绝大多数场景长度单位为“字节”；若遇到 KB 单位则折算
                             const L = isKB ? (Lraw << 10) : Lraw; // KB -> *1024
 
+                            function isComplete645AtStart() {
+                                if (b.length < 12 || b[0] !== 0x68 || b[7] !== 0x68) return false;
+                                const len645 = b[9] >>> 0;
+                                const total645 = 12 + len645;
+                                if (total645 > b.length) return false;
+                                if (b[total645 - 1] !== 0x16) return false;
+                                const cs = b[total645 - 2] >>> 0;
+                                return cs === sum8(b, 0, total645 - 2) || cs === sum8(b, 8, total645 - 2);
+                            }
+
                             // ------------------------ 关键防误判（核心修复点） ------------------------
                             // 误判根因：645 帧形态为 68 + 6字节地址 + 68 ...，地址字节中“偶然出现 0x16”
                             // 例如：68 02 80 16 00 00 00 68 ...
@@ -1119,6 +1129,7 @@ module.exports = function (RED) {
                             // 长度上限：防止错位/噪声把 L 解读成极大值导致 assembleBuf 长期等待。
                             const MAX_698_LEN_L = 2048;
                             if (L > MAX_698_LEN_L) {
+                                if (isComplete645AtStart()) return { ok: false };
                                 return { ok: false, used: 1, frame: input.slice(0, 1), err: "698_LEN_TOO_LARGE" };
                             }
 
@@ -1143,6 +1154,9 @@ module.exports = function (RED) {
                             // 半包：继续累积。这里必须显式告诉主循环“这是 698-LEN 半包”，
                             // 否则后续 645 parser 会把第一个 0x68 当作错位字节丢掉。
                             if (b.length < expectedEnd + 1) {
+                                // 若当前位置已经是完整且 CS 正确的 645 帧，让 645 parser 接管。
+                                // 不能仅凭 b[7] === 0x68 判断，否则会误伤 APDU 中第 8 字节刚好为 0x68 的正常 698 帧。
+                                if (isComplete645AtStart()) return { ok: false };
                                 return {
                                     ok: false,
                                     pending: true,
