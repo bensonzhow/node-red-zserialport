@@ -1,0 +1,15 @@
+{
+  "compiler": "Zig 0.13.0",
+  "targetOS": "Windows 7 (6.1)",
+  "protocol": 1,
+  "binaries": {
+    "x86": {
+      "file": "bin/windows/x86/zserial-sync.exe",
+      "sha256": "9f8edc79ff2f03266453f8f8a08255331602eace6fde7d2ed8993a2744cad640"
+    },
+    "x64": {
+      "file": "bin/windows/x64/zserial-sync.exe",
+      "sha256": "8792eda1aed78988a482669339521baf1e05a9c2cceb70807246b4b15436e440"
+    }
+  }
+}

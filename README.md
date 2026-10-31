@@ -7,6 +7,10 @@ node-zserial port
 
 ![node-red-zserialport](images/image.png)
 
+## 可选 Windows 同步模式（1.0.39）
+
+保持原默认后端；配置 `msg.serialConfig.backend` 或 `msg.serialConfigs` 每项的 `backend: "win32-sync"` 启用同步模式。安装包内置 x86/x64 辅助程序。详见 [同步模式安装使用](同步模式安装使用.md)，包含离线安装、配置示例和验收边界。
+
 ## 安装
 
 要安装稳定版本，可以使用 `菜单 - 管理调色板 - 安装` 选项并搜索 node-zserialport，或者在你的 Node-RED 用户目录（通常为 `~/.node-red`）下运行以下命令：

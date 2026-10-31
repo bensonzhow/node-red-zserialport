@@ -4,10 +4,56 @@ module.exports = function (RED) {
     "use strict";
     var settings = RED.settings;
     var events = require("events");
+    const { inspect } = require("util");
     const { SerialPort } = require('serialport');
     var bufMaxSize = 32768;  // Max serial buffer size, for inputs...
     const serialReconnectTime = settings.serialReconnectTime || 15000;
 
+    // Keep one listener per node/connection, with the latest request as context.
+    function watchInitError(node, connection, msg, serialConfig) {
+        if (!node._initErrorWatches) {
+            node._initErrorWatches = new Map();
+            node.on('close', function () {
+                node._initErrorWatches.forEach(function (watch) {
+                    watch.connection.off('initerror', watch.handler);
+                });
+                node._initErrorWatches.clear();
+            });
+        }
+        var port = serialConfig.serialport;
+        var watch = node._initErrorWatches.get(port);
+        if (watch && watch.connection !== connection) {
+            watch.connection.off('initerror', watch.handler);
+            node._initErrorWatches.delete(port);
+            watch = null;
+        }
+        if (!watch) {
+            watch = { connection: connection };
+            watch.handler = function (failedPort, attempt, err) {
+                var errorMsg = RED.util.cloneMessage(watch.msg);
+                errorMsg.status = 'ERR_INIT';
+                errorMsg.port = failedPort;
+                errorMsg.serialConfig = RED.util.cloneMessage(watch.serialConfig);
+                errorMsg.serialError = {
+                    phase: 'open',
+                    attempt: attempt,
+                    name: err.name,
+                    message: err.message || String(err),
+                    stack: err.stack,
+                    code: err.code,
+                    errno: err.errno,
+                    syscall: err.syscall,
+                    details: inspect(err, { showHidden: true, depth: null, colors: false,
+                        maxArrayLength: null, maxStringLength: null })
+                };
+                node.error('[zserial initerror] ' + failedPort + ': ' + errorMsg.serialError.message, errorMsg);
+            };
+            node._initErrorWatches.set(port, watch);
+            connection.on('initerror', watch.handler);
+        }
+        watch.msg = RED.util.cloneMessage(msg);
+        watch.serialConfig = RED.util.cloneMessage(serialConfig);
+    }
 
     function SerialCloseAllNode(n) {
         RED.nodes.createNode(this, n);
@@ -70,6 +116,8 @@ module.exports = function (RED) {
                 return;
             }
             let curPort = serialPool.get(msg.serialConfig);
+
+            watchInitError(node, curPort, msg, msg.serialConfig);
 
             if (msg.hasOwnProperty("baudrate")) {
                 var baud = parseInt(msg.baudrate);
@@ -236,6 +284,8 @@ module.exports = function (RED) {
             }
             let curPort = serialPool.get(msg.serialConfig);
 
+            watchInitError(node, curPort, msg, msg.serialConfig);
+
             if (msg.hasOwnProperty("baudrate")) {
                 var baud = parseInt(msg.baudrate);
                 if (isNaN(baud)) {
@@ -396,6 +446,7 @@ module.exports = function (RED) {
         }
         function getSerialServer(msg, serialConfig, done) {
             let curPort = serialPool.get(serialConfig);
+            watchInitError(node, curPort, msg, serialConfig);
 
             if (msg.hasOwnProperty("baudrate")) {
                 var baud = parseInt(msg.baudrate);
@@ -663,6 +714,7 @@ module.exports = function (RED) {
                         _txSeq: 0,
                         _framePending: null,
                         on: function (a, b) { this._emitter.on(a, b); },
+                        off: function (a, b) { this._emitter.off(a, b); },
                         once: function (a, b) { this._emitter.once(a, b); },
                         close: function (cb) {
                             this.serial.close(cb);
@@ -831,7 +883,9 @@ module.exports = function (RED) {
                             // obj._emitter.emit('retryerror', id, retryNum);
                             return null;
                         }
-                        obj.serial = new SerialPort({
+                        const PortImpl = serialConfig.backend === 'win32-sync'
+                            ? require('./lib/win32-sync-port') : SerialPort;
+                        obj.serial = new PortImpl({
                             path: port,
                             baudRate: baud,
                             dataBits: databits,
@@ -841,10 +895,25 @@ module.exports = function (RED) {
                             autoOpen: true
                         }, function (err, results) {
                             if (err) {
+                                RED.log.error("[zserial initerror] " + inspect({
+                                    port: port,
+                                    attempt: obj._retryNum,
+                                    maxAttempts: retryNum,
+                                    baudRate: baud,
+                                    dataBits: databits,
+                                    parity: parity,
+                                    stopBits: stopbits,
+                                    error: err
+                                }, {
+                                    showHidden: true,
+                                    depth: null,
+                                    colors: false,
+                                    maxArrayLength: null,
+                                    maxStringLength: null
+                                }));
                                 obj._emitter.emit('initerror', id, obj._retryNum, err);
                                 if (err.toString() !== olderr) {
                                     olderr = err.toString();
-                                    // RED.log.error("Err1:[serialconfig:" + id + "] " + RED._("serial.errors.error", { port: port, error: olderr }), {});
                                 }
                                 var delay = serialReconnectTime + Math.floor(Math.random() * 1000);
                                 obj.tout = setTimeout(function () {

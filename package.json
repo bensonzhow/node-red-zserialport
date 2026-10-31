@@ -1,6 +1,6 @@
 {
     "name": "node-zserial",
-    "version": "1.0.38",
+    "version": "1.0.40",
     "description": "Node-RED nodes to talk to serial ports",
     "dependencies": {
         "serialport": "^12.0.0"
@@ -22,5 +22,27 @@
     "engines": {
         "node": ">=16.0.0"
     },
-    "contributors": []
+    "contributors": [],
+    "files": [
+        "zserial.js",
+        "zserial.html",
+        "locales/",
+        "lib/",
+        "bin/windows/*/*.exe",
+        "bin/windows/manifest.json",
+        "native/",
+        "scripts/",
+        "images/",
+        "examples/",
+        "同步模式安装使用.md"
+    ],
+    "bundleDependencies": [
+        "serialport"
+    ],
+    "scripts": {
+        "test": "node --test test/*.test.js",
+        "build:win32-sync": "node scripts/build-win32-sync.js",
+        "verify:win32-sync": "node scripts/verify-win32-sync.js",
+        "prepack": "npm run verify:win32-sync"
+    }
 }
