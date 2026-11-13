@@ -8,7 +8,7 @@ const { EventEmitter } = require('events');
 const { PassThrough, Writable } = require('stream');
 const source = fs.readFileSync(path.join(__dirname, '../lib/win32-sync-port.js'), 'utf8');
 const tick = () => new Promise(resolve => setImmediate(resolve));
-function fixture({platform = 'win32', arch = 'x64', onCommand, spawnError, accessError, handshake = true} = {}) {
+function fixture({platform = 'win32', arch = 'x64', onCommand, spawnError, accessError, handshake = true, stuck = false} = {}) {
     const child = new EventEmitter(), commands = [], timers = new Set();
     child.stdout = new PassThrough(); child.stderr = new PassThrough();
     child.send = message => child.stdout.write(JSON.stringify({v: 1, ...message}) + '\n');
@@ -20,6 +20,7 @@ function fixture({platform = 'win32', arch = 'x64', onCommand, spawnError, acces
             if (cmd.op === 'close') process.nextTick(() => child.emit('close', 0, null));
         });
     }});
+    child.stdin.on('finish', () => { if (!stuck) process.nextTick(() => child.emit('close', 0, null)); });
     child.kill = () => { child.killed = true; process.nextTick(() => child.emit('close', 1, null)); };
     let spawnOptions, exe;
     const exports = {exports: {}};
@@ -96,7 +97,7 @@ test('unexpected exit fails pending write once and emits one close',async()=>{
 });
 test('protocol errors kill only this bridge',async()=>{
     const f=fixture();const p=await opened(f);let error;p.on('error',e=>error=e);
-    f.child.send({v:99,type:'data',data:'AA=='});await tick();assert(error);assert.equal(f.child.killed,true);assert.equal(f.timers.size,0);
+    f.child.send({v:99,type:'data',data:'AA=='});await tick();assert(error);assert.equal(f.child.stdin.writableEnded,true);assert.equal(f.timers.size,0);
 });
 test('close during startup cancels callback and pending writes',async()=>{
     const f=fixture({handshake:false});let opens=0,writes=0;
@@ -115,7 +116,7 @@ test('startup timeout kills hung child and leaves no callbacks/timers',async()=>
         const p=new f.Port({path:'COM11',baudRate:9600},e=>{assert.equal(e.code,'ERR_BRIDGE_TIMEOUT');resolve();});
         p.on('error',()=>errors++);
     });
-    await tick();assert.equal(errors,0);assert.equal(f.child.killed,true);assert.equal(f.timers.size,0);
+    await tick();assert.equal(errors,0);assert.equal(f.child.stdin.writableEnded,true);assert.equal(f.timers.size,0);
 });
 test('native close failure reaches close callback once',async()=>{
     const f=fixture({onCommand:(cmd,c)=>{if(cmd.op==='close'){c.send({type:'reply',id:cmd.id,ok:false,phase:'close',win32Code:6});return false;}}});
@@ -123,4 +124,15 @@ test('native close failure reaches close callback once',async()=>{
     p.on('error',()=>errors++);p.on('close',()=>closes++);
     await new Promise(resolve=>p.close(e=>{assert.equal(e.win32Code,6);resolve();}));
     await tick();assert.equal(errors,1);assert.equal(closes,1);assert.equal(f.timers.size,0);
+});
+
+test('unconfirmed exit blocks a second bridge for the same COM', async () => {
+    const f = fixture({stuck:true});
+    const first = await opened(f);
+    first.on('error', () => {});
+    f.child.send({v:99,type:'data'});
+    const err = await new Promise(resolve => new f.Port({path:'com11',baudRate:2400},resolve));
+    assert.equal(err.code,'ERR_BRIDGE_STILL_PRESENT');
+    f.child.emit('close',1,null);
+    assert.equal(f.timers.size,0);
 });

@@ -35,7 +35,8 @@ module.exports = function (RED) {
                 errorMsg.port = failedPort;
                 errorMsg.serialConfig = RED.util.cloneMessage(watch.serialConfig);
                 errorMsg.serialError = {
-                    phase: 'open',
+                    phase: err.phase || 'open',
+                    win32Code: err.win32Code, bridgePid: err.bridgePid, openAttemptId: err.openAttemptId,
                     attempt: attempt,
                     name: err.name,
                     message: err.message || String(err),
@@ -46,13 +47,24 @@ module.exports = function (RED) {
                     details: inspect(err, { showHidden: true, depth: null, colors: false,
                         maxArrayLength: null, maxStringLength: null })
                 };
-                node.error('[zserial initerror] ' + failedPort + ': ' + errorMsg.serialError.message, errorMsg);
+                const detail = err.backend === 'win32-sync'
+                    ? ' [attempt=' + attempt + ', bridgePid=' + err.bridgePid + ', openAttemptId=' + err.openAttemptId + ']' : '';
+                node.error('[zserial initerror] ' + failedPort + ': ' + errorMsg.serialError.message + detail, errorMsg);
             };
             node._initErrorWatches.set(port, watch);
             connection.on('initerror', watch.handler);
         }
         watch.msg = RED.util.cloneMessage(msg);
         watch.serialConfig = RED.util.cloneMessage(serialConfig);
+    }
+
+    function waitForClosing(configs, resume, fail) {
+        const pending = configs.map(config => serialPool.curConnections()[config.serialport])
+            .filter(connection => connection && connection.closePending)
+            .map(connection => connection.closePending);
+        if (!pending.length) return false;
+        Promise.all(pending).then(resume, fail);
+        return true;
     }
 
     function SerialCloseAllNode(n) {
@@ -74,12 +86,15 @@ module.exports = function (RED) {
             else if (msg.serialConfigs) {
                 let allLen = msg.serialConfigs.length;
                 let total = msg.serialConfigs.length;
+                let closeError;
                 try {
                     for (var i = 0; i < allLen; i++) {
                         let serialConfig = msg.serialConfigs[i];
                         serialPool.close(serialConfig.serialport, function (err) {
+                            closeError = closeError || err;
                             total--;
                             if (total <= 0) {
+                                if (closeError) return done(closeError);
                                 node.send(msg);
                                 done();
                             }
@@ -91,7 +106,8 @@ module.exports = function (RED) {
                 }
             }
             else {
-                serialPool.closeAll(() => {
+                serialPool.closeAll((err) => {
+                    if (err) return done(err);
                     node.send(msg);
                     done();
                 }, node);
@@ -115,6 +131,7 @@ module.exports = function (RED) {
                 done();
                 return;
             }
+            if (waitForClosing([msg.serialConfig], () => onMsg(msg, send, done), done)) return;
             let curPort = serialPool.get(msg.serialConfig);
 
             watchInitError(node, curPort, msg, msg.serialConfig);
@@ -282,6 +299,7 @@ module.exports = function (RED) {
                 done();
                 return;
             }
+            if (waitForClosing([msg.serialConfig], () => onMsg(msg, send, done), done)) return;
             let curPort = serialPool.get(msg.serialConfig);
 
             watchInitError(node, curPort, msg, msg.serialConfig);
@@ -408,6 +426,7 @@ module.exports = function (RED) {
             sendAll(done);
         }
         function onMsg(msg, send, done) {
+            if (msg.serialConfigs && waitForClosing(msg.serialConfigs, () => onMsg(msg, send, done), done)) return;
             initMsg(msg);
             if (!msg.serialConfigs) {
                 node.error("需要配置批量配置：msg.serialConfigs");
@@ -875,7 +894,9 @@ module.exports = function (RED) {
                     //newline = newline.replace("\\n","\n").replace("\\r","\r");
                     obj._emitter.setMaxListeners(500);
                     var olderr = "";
+                    obj.syncBackend = serialConfig.backend === "win32-sync";
                     var setupSerial = function () {
+                        if (obj.syncBackend && obj._closing) return;
                         obj._retryNum++;
                         // RED.log.info(obj._retryNum)
                         if (obj._retryNum > retryNum) {
@@ -894,6 +915,7 @@ module.exports = function (RED) {
                             //parser: serialp.parsers.raw,
                             autoOpen: true
                         }, function (err, results) {
+                            if (obj.syncBackend && obj._closing) return;
                             if (err) {
                                 RED.log.error("[zserial initerror] " + inspect({
                                     port: port,
@@ -928,6 +950,7 @@ module.exports = function (RED) {
                             _zemitter.emit('connNumChange', Object.keys(connections).length)
                         });
                         obj.serial.on('error', function (err) {
+                            if (obj.syncBackend && obj._closing) return;
                             obj.isopen = false;
                             serialPool.zlog("Err2:[serialconfig:" + id + "] " + RED._("serial.errors.error", { port: port, error: err.toString() }), {});
                             obj._emitter.emit('closed', id);
@@ -1533,6 +1556,21 @@ module.exports = function (RED) {
             },
             close: function (port, done, node) {
                 if (connections[port]) {
+                    const connection = connections[port];
+                    if (connection.syncBackend) {
+                        if (!connection.closePending) {
+                            connection._closing = true;
+                            clearTimeout(connection.tout);
+                            connection.closePending = Promise.resolve().then(() => new Promise((resolve, reject) => {
+                                connection.close(err => err ? reject(err) : resolve());
+                            })).finally(() => {
+                                if (connections[port] === connection) delete connections[port];
+                                _zemitter.emit('connNumChange', Object.keys(connections).length);
+                            }).then(() => { _zemitter.emit('afterClosed', port); });
+                        }
+                        connection.closePending.then(() => done(), done);
+                        return;
+                    }
                     if (connections[port].tout != null) {
                         clearTimeout(connections[port].tout);
                     }
@@ -1565,6 +1603,7 @@ module.exports = function (RED) {
                 serialPool.zlog(node, "开始关闭所有串口连接");
                 serialPool.zlog(node, connections);
                 var keys = Object.keys(connections), total = keys.length;
+                let closeError;
                 serialPool.zlog(node, "需要关闭的连接数: " + total);
 
                 // 如果没有连接需要关闭，立即完成
@@ -1576,9 +1615,10 @@ module.exports = function (RED) {
                 try {
                     for (var i = 0; i < keys.length; i++) {
                         serialPool.close(keys[i], function (err) {
+                            closeError = closeError || err;
                             total--;
                             if (total <= 0) {
-                                done();
+                                done(closeError);
                                 serialPool.zlog(node, "全部关闭完成");
                             }
                         }, node);

@@ -40,3 +40,19 @@ test('port pool preserves first configuration until close',()=>{
     const b=f.pool.get({serialport:'COM11',backend:'win32-sync'});
     assert.equal(a,b);assert.equal(f.created.length,1);assert.equal(f.loaded.length,0);
 });
+test('sync close retains the port until exit and coalesces concurrent closes',async()=>{
+    const {pool,created}=fixture();
+    const config={serialport:'COM15',backend:'win32-sync'};
+    const connection=pool.get(config);
+    let finish, closes=0;
+    created[0].close=cb=>{closes++;finish=cb;};
+    const close=()=>new Promise((resolve,reject)=>pool.close('COM15',err=>err?reject(err):resolve()));
+    const first=close(), second=close();
+    await Promise.resolve();
+    assert.equal(pool.curConnections().COM15,connection);
+    assert.equal(closes,1);
+    finish();
+    await Promise.all([first,second]);
+    assert.equal(pool.curConnections().COM15,undefined);
+    assert.notEqual(pool.get(config),connection);
+});

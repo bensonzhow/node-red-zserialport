@@ -4,7 +4,7 @@
 #include <windows.h>
 #include "runtime.h"
 
-#define BUILD "1.0.39-sync1"
+#define BUILD "1.0.44-sync3"
 #define LINE_MAXIMUM (2*1024*1024)
 #define QUEUE_MAXIMUM 256
 #define BYTE_MAXIMUM (6*1024*1024)
@@ -13,6 +13,8 @@ static HANDLE serial = INVALID_HANDLE_VALUE, parent;
 static CRITICAL_SECTION queueLock;
 static char *queue[QUEUE_MAXIMUM];
 static unsigned head, count, queuedBytes;
+static HANDLE ioThread;
+static volatile LONG closingRequested, reading;
 static volatile LONG alive = 1, pulse;
 static const char b64[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -78,7 +80,14 @@ static unsigned char *decode(const char *s,DWORD *length){
 static DWORD WINAPI reader(LPVOID ignored){
     (void)ignored;char *line=malloc(LINE_MAXIMUM+1);if(!line)ExitProcess(4);size_t n=0;
     int c;while((c=getchar())!=EOF){if(c=='\n'){
-        line[n]=0;EnterCriticalSection(&queueLock);
+        line[n]=0;
+        /* Inspect the small close command without modifying the queued JSON. */
+        if(n<128){
+            char copy[128];Message m;memcpy(copy,line,n+1);
+            if(parse(copy,&m) && str(&m,"op") && !strcmp(str(&m,"op"),"close"))
+                InterlockedExchange(&closingRequested,1);
+        }
+        EnterCriticalSection(&queueLock);
         if(count>=QUEUE_MAXIMUM || queuedBytes+n>BYTE_MAXIMUM){LeaveCriticalSection(&queueLock);ExitProcess(5);}
         char *copy=malloc(n+1);if(!copy){LeaveCriticalSection(&queueLock);ExitProcess(4);}memcpy(copy,line,n+1);
         queue[(head+count)%QUEUE_MAXIMUM]=copy;count++;queuedBytes+=(unsigned)n;LeaveCriticalSection(&queueLock);n=0;
@@ -87,27 +96,34 @@ static DWORD WINAPI reader(LPVOID ignored){
 }
 static DWORD WINAPI watchdog(LPVOID ignored){
     (void)ignored;for(;;){Sleep(500);
-        if(!InterlockedCompareExchange(&alive,1,1) || WaitForSingleObject(parent,0)==WAIT_OBJECT_0)ExitProcess(0);
+        if(WaitForSingleObject(parent,0)==WAIT_OBJECT_0)InterlockedExchange(&alive,0);
+        if(!InterlockedCompareExchange(&alive,1,1) ||
+           (InterlockedCompareExchange(&closingRequested,0,0) && InterlockedCompareExchange(&reading,0,0)))
+            CancelSynchronousIo(ioThread);
         if((DWORD)(GetTickCount()-(DWORD)InterlockedCompareExchange(&pulse,0,0))>10000)ExitProcess(124);
     }return 0;
 }
-static DWORD configure(Message *m){
+static DWORD configure(Message *m,const char **phase){
     double baud=number(m,"baud"),bits=number(m,"bits"),stops=number(m,"stops");const char *parity=str(m,"parity"),*port=str(m,"port");
     if(!port||strlen(port)>24||strncmp(port,"COM",3)||!port[3]||baud<1||baud>4294967295.0||baud!=(DWORD)baud||bits<5||bits>8||bits!=(BYTE)bits||!(stops==1||stops==1.5||stops==2)||!parity)return ERROR_INVALID_PARAMETER;
     for(const char *p=port+3;*p;p++)if(!isdigit((unsigned char)*p))return ERROR_INVALID_PARAMETER;
     BYTE par;if(!strcmp(parity,"none"))par=NOPARITY;else if(!strcmp(parity,"even"))par=EVENPARITY;else if(!strcmp(parity,"odd"))par=ODDPARITY;else if(!strcmp(parity,"mark"))par=MARKPARITY;else if(!strcmp(parity,"space"))par=SPACEPARITY;else return ERROR_INVALID_PARAMETER;
     char name[32];snprintf(name,sizeof(name),"\\\\.\\%s",port);
+    *phase="CreateFileA";
     serial=CreateFileA(name,GENERIC_READ|GENERIC_WRITE,0,NULL,OPEN_EXISTING,0,NULL);
     if(serial==INVALID_HANDLE_VALUE)return GetLastError();
     DCB d;memset(&d,0,sizeof(d));d.DCBlength=sizeof(d);DWORD code=0;
+    *phase="GetCommState";
     if(!GetCommState(serial,&d)){code=GetLastError();goto bad;}
     /* Exactly the successful diagnostic's control flags, retaining character fields. */
     d.BaudRate=(DWORD)baud;d.ByteSize=(BYTE)bits;d.Parity=par;d.StopBits=stops==1?ONESTOPBIT:stops==1.5?ONE5STOPBITS:TWOSTOPBITS;
     d.fBinary=1;d.fParity=par!=NOPARITY;d.fOutxCtsFlow=0;d.fOutxDsrFlow=0;d.fDtrControl=DTR_CONTROL_ENABLE;
     d.fDsrSensitivity=0;d.fTXContinueOnXoff=0;d.fOutX=0;d.fInX=0;d.fErrorChar=0;d.fNull=0;d.fRtsControl=RTS_CONTROL_DISABLE;d.fAbortOnError=0;d.fDummy2=0;
+    *phase="SetCommState";
     if(!SetCommState(serial,&d)){code=GetLastError();goto bad;}
     if(GetCommState(serial,&d))fprintf(stderr,"DCB readback baud=%lu parity=%u DTR=%u RTS=%u\n",(unsigned long)d.BaudRate,d.Parity,d.fDtrControl,d.fRtsControl);
     COMMTIMEOUTS t;memset(&t,0,sizeof(t));t.ReadIntervalTimeout=20;t.ReadTotalTimeoutConstant=200;t.WriteTotalTimeoutConstant=3000;
+    *phase="SetCommTimeouts";
     if(!SetCommTimeouts(serial,&t)){code=GetLastError();goto bad;}
     if(GetCommTimeouts(serial,&t))fprintf(stderr,"Timeout readback interval=%lu read=%lu write=%lu\n",(unsigned long)t.ReadIntervalTimeout,(unsigned long)t.ReadTotalTimeoutConstant,(unsigned long)t.WriteTotalTimeoutConstant);
     return 0;
@@ -117,12 +133,13 @@ static void command(char *line){
     Message m;if(!parse(line,&m))fatal("protocol",ERROR_INVALID_DATA);
     double idValue=number(&m,"id");if(number(&m,"v")!=1||idValue<1||idValue>4294967295.0||idValue!=(unsigned)idValue)fatal("protocol",ERROR_INVALID_DATA);
     unsigned id=(unsigned)idValue;const char *op=str(&m,"op");if(!op)fatal("protocol",ERROR_INVALID_DATA);
+    const char *phase=op;
     DWORD code=0,written=0;
     if(!strcmp(op,"close")){
         if(serial!=INVALID_HANDLE_VALUE){if(!CloseHandle(serial))code=GetLastError();serial=INVALID_HANDLE_VALUE;}
         reply(id,!code,"close",code,0);ExitProcess(code?1:0);
     } else if(!strcmp(op,"open")) {
-        code=serial==INVALID_HANDLE_VALUE?configure(&m):ERROR_ALREADY_EXISTS;
+        code=serial==INVALID_HANDLE_VALUE?configure(&m,&phase):ERROR_ALREADY_EXISTS;
     } else if(serial==INVALID_HANDLE_VALUE)code=ERROR_INVALID_HANDLE;
     else if(!strcmp(op,"write")){
         DWORD length;unsigned char *data=decode(str(&m,"data"),&length);if(!data)code=ERROR_INVALID_DATA;
@@ -145,12 +162,14 @@ static void command(char *line){
     } else if(!strcmp(op,"flush")){
         if(!PurgeComm(serial,PURGE_RXCLEAR|PURGE_TXCLEAR|PURGE_RXABORT|PURGE_TXABORT))code=GetLastError();
     } else code=ERROR_INVALID_FUNCTION;
-    reply(id,!code,op,code,written);
+    reply(id,!code,phase,code,written);
+    if(code && !strcmp(op,"open"))ExitProcess(1);
 }
 int main(int argc,char **argv){
     if(argc!=2)return 2;char *end;unsigned long pid=strtoul(argv[1],&end,10);if(*end||!pid)return 2;
     parent=OpenProcess(SYNCHRONIZE,FALSE,(DWORD)pid);if(!parent)return 2;
     _setmode(_fileno(stdin),_O_BINARY);_setmode(_fileno(stdout),_O_BINARY);setvbuf(stderr,NULL,_IONBF,0);
+    if(!DuplicateHandle(GetCurrentProcess(),GetCurrentThread(),GetCurrentProcess(),&ioThread,0,FALSE,DUPLICATE_SAME_ACCESS))return 2;
     InitializeCriticalSection(&queueLock);InterlockedExchange(&pulse,(LONG)GetTickCount());
     HANDLE r=CreateThread(NULL,0,reader,NULL,0,NULL),w=CreateThread(NULL,0,watchdog,NULL,0,NULL);if(!r||!w)return 2;CloseHandle(r);CloseHandle(w);
     char hello[160];snprintf(hello,sizeof(hello),"{\"v\":1,\"type\":\"hello\",\"build\":\"%s\",\"bits\":%u}\n",BUILD,(unsigned)(sizeof(void*)*8));output(hello);
@@ -161,7 +180,15 @@ int main(int argc,char **argv){
             if(!line)break;command(line);free(line);InterlockedExchange(&pulse,(LONG)GetTickCount());
         }
         if(serial!=INVALID_HANDLE_VALUE){unsigned char data[4096];DWORD n=0;
-            if(!ReadFile(serial,data,sizeof(data),&n,NULL))fatal("ReadFile",GetLastError());
+            InterlockedExchange(&reading,1);
+            if(InterlockedCompareExchange(&closingRequested,0,0)){InterlockedExchange(&reading,0);continue;}
+            BOOL ok=ReadFile(serial,data,sizeof(data),&n,NULL);
+            DWORD readError=ok?0:GetLastError();
+            InterlockedExchange(&reading,0);
+            if(!ok){
+                if(readError==ERROR_OPERATION_ABORTED && (closingRequested || !alive))continue;
+                fatal("ReadFile",readError);
+            }
             if(n)rx(data,n);else Sleep(5);
         }else Sleep(10);
     }

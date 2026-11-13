@@ -41,6 +41,7 @@ if (require.main === module) enableFileLogging();
 // 可直接修改默认配置，也可用命令行参数覆盖。默认自动探测：先 698，失败后 645；--hex/--text 为自定义发送模式。
 const CONFIG = {
     port: 'COM11',
+    backend: 'serialport',
     baudRate: 9600,
     dataBits: 8,
     stopBits: 1,
@@ -81,7 +82,7 @@ function parseArgs(args) {
     const config = { ...CONFIG };
     const numbers = { '--baud': 'baudRate', '--data-bits': 'dataBits',
         '--stop-bits': 'stopBits', '--open-timeout': 'openTimeout', '--timeout': 'receiveTimeout', '--open-delay': 'openDelay' };
-    const strings = { '--port': 'port', '--parity': 'parity', '--hex': 'hex', '--text': 'text', '--rts': 'rts', '--dtr': 'dtr' };
+    const strings = { '--backend': 'backend', '--port': 'port', '--parity': 'parity', '--hex': 'hex', '--text': 'text', '--rts': 'rts', '--dtr': 'dtr' };
     let payloadOption;
     for (let i = 0; i < args.length; i++) {
         const key = args[i];
@@ -101,6 +102,8 @@ function parseArgs(args) {
         config[numbers[key] || strings[key]] = numbers[key] ? Number(value) : value;
     }
     if (config.help || config.listOnly) return config;
+    if (!['serialport', 'win32-sync'].includes(config.backend)) throw new Error('backend 必须为 serialport/win32-sync');
+    if (config.backend === 'win32-sync') config.skipDrain = true;
     if (!config.port.trim()) throw new Error('串口路径不能为空');
     if (!Number.isInteger(config.baudRate) || config.baudRate <= 0) throw new Error('波特率必须为正整数');
     if (![5, 6, 7, 8].includes(config.dataBits)) throw new Error('数据位必须为 5/6/7/8');
@@ -245,7 +248,8 @@ async function main() {
   node test.js --port COM11 --baud 9600 --text "hello" --timeout 10000
   node test.js --port COM11 --baud 9600 --parity even --timeout 5000
 
-参数：--port --baud --data-bits --stop-bits --parity
+参数：--backend serialport/win32-sync（同步模式自动跳过 drain）
+      --port --baud --data-bits --stop-bits --parity
       --hex / --text（不自动追加换行）
       --skip-drain 完全跳过 FlushFileBuffers，只等待 write 回调
       --open-delay 打开并设置控制线后等待毫秒，默认 0
@@ -293,7 +297,10 @@ async function main() {
         dataBits: config.dataBits, stopBits: config.stopBits, parity: config.parity, autoOpen: false };
     log('兼容测试配置', inspect({skipDrain: config.skipDrain, openDelay: config.openDelay, rts: config.rts, dtr: config.dtr}, options));
     log('打开配置', inspect(serialOptions, options));
-    const port = new SerialPort(serialOptions);
+    log('实际测试后端', config.backend);
+    const PortImpl = config.backend === 'win32-sync' ? require('./lib/win32-sync-port') : SerialPort;
+    const port = new PortImpl(serialOptions);
+    let rawReceived = Buffer.alloc(0);
     let stopping = false;
     let receiveTimer;
     let openTimer;
@@ -313,6 +320,9 @@ async function main() {
         clearTimeout(sendTimer);
         clearTimeout(prepareTimer);
         log('接收总字节数', received);
+        packet('RX 汇总（最多64KiB）', rawReceived);
+        if (!config.autoProbe) log('645解析结果', inspect(parseResponse(rawReceived, '645'), options));
+        if (config.backend === 'win32-sync') log('同步后端诊断', inspect({bridgeVersion: port._bridgeVersion, configuration: port._wireOptions, stderr: port._stderr}, options));
         if (port.isOpen) {
             closeTimer = setTimeout(() => { error('CLOSE TIMEOUT', new Error('驱动关闭超时')); process.exit(1); }, 3000);
             port.close(err => {
@@ -381,6 +391,7 @@ async function main() {
 
     port.on('data', data => {
         received += data.length;
+        rawReceived = Buffer.concat([rawReceived, data]).subarray(-65536);
         packet('RX', data);
         if (!config.autoProbe || probeIndex < 0 || stopping) return;
         // 限制异常连续流占用；每次扫描均保留最近 64 KiB。
