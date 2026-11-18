@@ -31,7 +31,7 @@ function fixture({platform = 'win32', arch = 'x64', onCommand, spawnError, acces
         setTimeout: (fn, ms) => { const t = setTimeout(() => {timers.delete(t); fn();}, ms); timers.add(t); return t; },
         clearTimeout: t => {timers.delete(t); clearTimeout(t);},
         require: name => {
-            if(name === 'fs') return {constants: fs.constants, accessSync: () => {if(accessError)throw accessError;}};
+            if(name === 'fs') return {mkdirSync:fs.mkdirSync, appendFileSync:fs.appendFileSync, constants: fs.constants, accessSync: () => {if(accessError)throw accessError;}};
             if(name === 'child_process') return {spawn: (file, args, opts) => {
                 exe = file; spawnOptions = opts;
                 process.nextTick(() => {
@@ -134,5 +134,48 @@ test('unconfirmed exit blocks a second bridge for the same COM', async () => {
     const err = await new Promise(resolve => new f.Port({path:'com11',baudRate:2400},resolve));
     assert.equal(err.code,'ERR_BRIDGE_STILL_PRESENT');
     f.child.emit('close',1,null);
+    assert.equal(f.timers.size,0);
+});
+
+test('diagnostics correlate native stages, baud-specific commands and confirmed exit', async () => {
+    const f = fixture();
+    f.child.pid = 6224;
+    const dir = fs.mkdtempSync(path.join(require('os').tmpdir(),'zserial-test-'));
+    try {
+        const port = new f.Port({path:'COM17', baudRate:9600, autoOpen:false, diagnosticDir:dir});
+        await new Promise((resolve,reject) => port.open(err => err ? reject(err) : resolve()));
+        await new Promise((resolve,reject) => port.write(Buffer.from([0x68]),err => err ? reject(err) : resolve(),2400));
+        f.child.stderr.write('event=close-received stage=ReadFile\n');
+        await closed(port);
+        const log = fs.readFileSync(path.join(dir,fs.readdirSync(dir)[0]),'utf8').trim().split('\n').map(JSON.parse);
+        const tx = log.find(e => e.event==='request' && e.op==='write');
+        assert.equal(tx.baud,2400);
+        assert.equal(f.commands.find(c => c.op==='write').baud,2400);
+        assert.ok(log.some(e => e.event==='reply' && e.id===tx.id && e.written===1));
+        assert.ok(log.some(e => e.event==='native' && e.text.includes('ReadFile')));
+        assert.equal(log.at(-1).event,'exit');
+        assert.equal(log.at(-1).bridgePid,6224);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+});
+
+test('close rejects further writes and waits for actual process exit after acknowledgement', async () => {
+    const f = fixture({onCommand(cmd, child) {
+        if (cmd.op === 'close') {
+            child.send({type:'reply',id:cmd.id,ok:true});
+            return false;
+        }
+    }});
+    const port = await opened(f);
+    let completed = 0;
+    port.close(err => {assert.ifError(err); completed++;});
+    await new Promise(resolve => port.write(Buffer.from([1]), err => {
+        assert.ok(err);
+        resolve();
+    }));
+    await tick();
+    assert.equal(completed,0);
+    assert.equal(f.commands.filter(cmd => cmd.op==='write').length,0);
+    f.child.emit('close',0,null);
+    assert.equal(completed,1);
     assert.equal(f.timers.size,0);
 });

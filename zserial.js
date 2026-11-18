@@ -67,9 +67,27 @@ module.exports = function (RED) {
         return true;
     }
 
+    function batchCloseError(errors) {
+        if (errors.length <= 1) return errors[0];
+        return Object.assign(new Error(errors.map(err => err.message).join('; ')), { errors });
+    }
+
     function SerialCloseAllNode(n) {
         RED.nodes.createNode(this, n);
         var node = this;
+
+        function finishClose(msg, err, done) {
+            if (err) {
+                const errors = err.errors || [err];
+                if (!errors.every(e => e.backend === 'win32-sync' && e.code === 'ERR_BRIDGE_STILL_PRESENT')) {
+                    return done(err);
+                }
+                msg.serialCloseErrors = errors.map(e => ({port:e.port, bridgePid:e.bridgePid, code:e.code, message:e.message}));
+                node.error(err, RED.util.cloneMessage(msg));
+            }
+            node.send(msg);
+            done();
+        }
 
         function onMsg(msg, send, done) {
             if (msg.serialConfig) {
@@ -81,24 +99,22 @@ module.exports = function (RED) {
                     }
                     node.send(msg);
                     done();
-                }, node);
+                }, node, msg.forceClose !== true);
             }
             else if (msg.serialConfigs) {
                 let allLen = msg.serialConfigs.length;
                 let total = msg.serialConfigs.length;
-                let closeError;
+                const closeErrors = [];
                 try {
                     for (var i = 0; i < allLen; i++) {
                         let serialConfig = msg.serialConfigs[i];
                         serialPool.close(serialConfig.serialport, function (err) {
-                            closeError = closeError || err;
+                            if (err) closeErrors.push(err);
                             total--;
                             if (total <= 0) {
-                                if (closeError) return done(closeError);
-                                node.send(msg);
-                                done();
+                                finishClose(msg, batchCloseError(closeErrors), done);
                             }
-                        }, node);
+                        }, node, msg.forceClose !== true);
                     }
                 } catch (error) {
                     node.error(error, msg);
@@ -107,10 +123,8 @@ module.exports = function (RED) {
             }
             else {
                 serialPool.closeAll((err) => {
-                    if (err) return done(err);
-                    node.send(msg);
-                    done();
-                }, node);
+                    finishClose(msg, err, done);
+                }, node, msg.forceClose !== true);
             }
         }
         this.on("input", function (msg, send, done) {
@@ -136,7 +150,7 @@ module.exports = function (RED) {
 
             watchInitError(node, curPort, msg, msg.serialConfig);
 
-            if (msg.hasOwnProperty("baudrate")) {
+            if (msg.hasOwnProperty("baudrate") && (!curPort.keepOpen || !msg.hasOwnProperty("payload") && !msg.serialConfigs)) {
                 var baud = parseInt(msg.baudrate);
                 if (isNaN(baud)) {
                     node.error(RED._("serial.errors.badbaudrate"), msg);
@@ -174,7 +188,7 @@ module.exports = function (RED) {
                         msg.status = "OK";
                     }
                     done();
-                });
+                }, msg);
             }
         }
 
@@ -304,7 +318,7 @@ module.exports = function (RED) {
 
             watchInitError(node, curPort, msg, msg.serialConfig);
 
-            if (msg.hasOwnProperty("baudrate")) {
+            if (msg.hasOwnProperty("baudrate") && (!curPort.keepOpen || !msg.hasOwnProperty("payload") && !msg.serialConfigs)) {
                 var baud = parseInt(msg.baudrate);
                 if (isNaN(baud)) {
                     node.error(RED._("serial.errors.badbaudrate"), msg);
@@ -426,7 +440,30 @@ module.exports = function (RED) {
             sendAll(done);
         }
         function onMsg(msg, send, done) {
-            if (msg.serialConfigs && waitForClosing(msg.serialConfigs, () => onMsg(msg, send, done), done)) return;
+            const configs = msg.serialConfigs || [];
+            const pending = configs.map(config => serialPool.curConnections()[config.serialport]?.closePending);
+            if (pending.some(Boolean)) {
+                if (!configs.every(config => config.backend === 'win32-sync')) {
+                    Promise.all(pending).then(() => onMsg(msg, send, done), done);
+                    return;
+                }
+                Promise.allSettled(pending).then(results => {
+                    const failed = new Map();
+                    for (const [index, result] of results.entries()) {
+                        if (result.status !== 'rejected') continue;
+                        const err = result.reason;
+                        if (configs[index].backend !== 'win32-sync' || err.code !== 'ERR_BRIDGE_STILL_PRESENT') {
+                            return done(err);
+                        }
+                        failed.set(configs[index].serialport, err);
+                    }
+                    runBatch(msg, done, failed);
+                }).catch(done);
+                return;
+            }
+            runBatch(msg, done);
+        }
+        function runBatch(msg, done, failed) {
             initMsg(msg);
             if (!msg.serialConfigs) {
                 node.error("需要配置批量配置：msg.serialConfigs");
@@ -438,7 +475,13 @@ module.exports = function (RED) {
             for (var i = 0; i < msg.serialConfigs.length; i++) {
                 var serialConfig = msg.serialConfigs[i];
                 serialConfig._msgid = msg._msgid + "_" + i;
-                getSerialServer( msg, serialConfig, done);
+                const port = serialConfig.serialport;
+                if (failed && failed.has(port)) {
+                    const err = failed.get(port);
+                    zsend(null, {...serialConfig, port, status:'ERR_CLOSE', text:err.message, bridgePid:err.bridgePid}, null, port, done);
+                } else {
+                    getSerialServer(msg, serialConfig, done);
+                }
             }
         }
 
@@ -465,9 +508,12 @@ module.exports = function (RED) {
         }
         function getSerialServer(msg, serialConfig, done) {
             let curPort = serialPool.get(serialConfig);
+            if (curPort.keepOpen && msg.baudrate !== undefined) {
+                serialConfig = {...serialConfig, baudrate:msg.baudrate};
+            }
             watchInitError(node, curPort, msg, serialConfig);
 
-            if (msg.hasOwnProperty("baudrate")) {
+            if (msg.hasOwnProperty("baudrate") && (!curPort.keepOpen || !msg.hasOwnProperty("payload") && !msg.serialConfigs)) {
                 var baud = parseInt(msg.baudrate);
                 if (isNaN(baud)) {
                     // node.error(RED._("serial.errors.badbaudrate"), msg);
@@ -501,6 +547,7 @@ module.exports = function (RED) {
             }
             if (msg.hasOwnProperty("flush") && msg.flush === true) { curPort.serial.flush(); }
 
+            if (curPort.keepOpen) node._syncBatchDone = done;
             setCallback(msg, serialConfig, done);
             // // msg.payload = serialConfig.payload;
             // setTimeout(function () {
@@ -594,7 +641,7 @@ module.exports = function (RED) {
                 if (sender !== node) { return; }
                 try {
                     msgout.status = "OK";
-                    zsend(msgout, null, null, curPort.serial.path, done);
+                    zsend(msgout, null, null, curPort.serial.path, curPort.keepOpen ? node._syncBatchDone : done);
                 } catch (error) {
                     node.error(error)
                 }
@@ -606,7 +653,7 @@ module.exports = function (RED) {
                 msgout.status = "ERR_TIMEOUT";
                 msgout.port = curPort.serial.path;
                 node.status({ fill: "red", shape: "ring", text: "timeout:::" + curPort.serial.path });
-                zsend(null, msgout, null, curPort.serial.path, done);
+                zsend(null, msgout, null, curPort.serial.path, curPort.keepOpen ? node._syncBatchDone : done);
             }
 
             node[`_dataHandler_${curPort.serial.path}`] = dataHandler
@@ -716,6 +763,7 @@ module.exports = function (RED) {
 
                 if (addchar.substr(0, 2) == "0x") { addchar = new Buffer.from([addchar]); }
                 let assembleBuf = Buffer.alloc(0);
+                let recoveringFrame = false;
                 connections[id] = (function () {
                     var obj = {
                         _emitter: new events.EventEmitter(),
@@ -753,7 +801,11 @@ module.exports = function (RED) {
                             }
                             return payload;
                         },
-                        write: function (m, cb) { this.serial.write(m, cb); },
+                        write: function (m, cb, request) {
+                            const rate = request && (request.baudrate ?? request.serialConfig?.serialbaud ?? request.serialbaud);
+                            if (this.keepOpen && rate != null) this.serial.write(m, cb, Number(rate));
+                            else this.serial.write(m, cb);
+                        },
                         update: function (m, cb) { this.serial.update(m, cb); },
                         enqueue: function (msg, sender, cb, encb) {
                             var payload = this.encodePayload(msg.payload);
@@ -780,10 +832,10 @@ module.exports = function (RED) {
                             var qobj = this.queue[0];
                             qobj._done = false;
                             qobj._txId = (++obj._txSeq);
-                            this.write(qobj.payload, qobj.cb);
                             var msg = qobj.msg;
                             var timeout = msg.timeout || responsetimeout;
                             var maxPartialWait = msg.maxPartialWait || serialConfig.maxPartialWait || (timeout * 2);
+                            const sentAt = Date.now();
                             var scheduleTimeout = function (delay) {
                                 obj.tout = setTimeout(onResponseTimeout, delay);
                             };
@@ -795,20 +847,19 @@ module.exports = function (RED) {
                                 if (obj.queue[0] !== qobj) { return; }
                                 if (qobj._done) { return; }
 
-                                if (spliton === "frame" && obj._framePending && obj._framePending.proto === '698-len') {
+                                if (spliton === "frame" && obj._framePending) {
                                     var now = Date.now();
-                                    var startedAt = obj._framePending.since || now;
+                                    var startedAt = Math.max(sentAt, obj._framePending.since);
                                     var waited = now - startedAt;
-                                    if (waited < maxPartialWait) {
-                                        scheduleTimeout(Math.max(50, Math.min(timeout, maxPartialWait - waited)));
+                                    const remaining = Math.min(maxPartialWait - waited, sentAt + Number(timeout) + Number(maxPartialWait) - now);
+                                    if (remaining > 0) {
+                                        scheduleTimeout(Math.min(Math.max(50, timeout), remaining));
                                         return;
                                     }
                                 }
 
                                 qobj._done = true;
 
-                                var msgout = obj.dequeue(true) || {};
-                                msgout.port = id;
                                 // // if we have some leftover stuff, just send it
                                 // if (i !== 0) {
                                 //     var m = buf.slice(0, i);
@@ -820,10 +871,10 @@ module.exports = function (RED) {
                                 // Prefer flushing data depending on split mode
                                 var m = null;
                                 if (spliton === "frame") {
-                                    if (typeof assembleBuf !== "undefined" && assembleBuf && assembleBuf.length) {
-                                        m = Buffer.from(assembleBuf);
-                                        assembleBuf = Buffer.alloc(0); // 清掉残留
-                                    }
+                                    if (assembleBuf.length) m = assembleBuf;
+                                    assembleBuf = Buffer.alloc(0);
+                                    recoveringFrame = false;
+                                    obj._framePending = null;
                                 } else {
                                     if (i !== 0) {
                                         m = buf.slice(0, i);
@@ -831,6 +882,8 @@ module.exports = function (RED) {
                                     }
                                 }
 
+                                var msgout = obj.dequeue(true) || {};
+                                msgout.port = id;
                                 if (m) {
                                     if (spliton === "frame") {
                                         const mbuf = Buffer.from(m);
@@ -852,11 +905,11 @@ module.exports = function (RED) {
                                     }
                                 }
                                 msgout.status = "ERR_TIMEOUT";
-                                obj._framePending = null;
                                 /* Notify the sender that a timeout occurred */
                                 obj._emitter.emit('timeout', msgout, qobj.sender);
                             };
                             scheduleTimeout(timeout);
+                            this.write(qobj.payload, qobj.cb, qobj.msg);
                         },
                         dequeue: function (ignoreRxTokenGuard) {
                             // if we are trying to dequeue stuff from an
@@ -895,8 +948,20 @@ module.exports = function (RED) {
                     obj._emitter.setMaxListeners(500);
                     var olderr = "";
                     obj.syncBackend = serialConfig.backend === "win32-sync";
+                    obj.keepOpen = obj.syncBackend && (serialConfig.syncKeepOpen ?? settings.zserialSyncKeepOpen) === true;
                     var setupSerial = function () {
                         if (obj.syncBackend && obj._closing) return;
+                        // Keep ownership of the failed adapter until its child really exits.
+                        if (obj.syncBackend && obj.serial && obj.serial.bridgePresent) {
+                            if (!obj.retryAfterExit) {
+                                obj.retryAfterExit = true;
+                                obj.serial.once('bridgeReleased', () => {
+                                    obj.retryAfterExit = false;
+                                    if (!obj._closing) setupSerial();
+                                });
+                            }
+                            return;
+                        }
                         obj._retryNum++;
                         // RED.log.info(obj._retryNum)
                         if (obj._retryNum > retryNum) {
@@ -913,6 +978,8 @@ module.exports = function (RED) {
                             parity: parity,
                             stopBits: stopbits,
                             //parser: serialp.parsers.raw,
+                            ...(obj.syncBackend && (serialConfig.syncDiagnostics ?? settings.zserialSyncDiagnostics) === true
+                                ? { diagnosticDir: require('path').join(settings.userDir || process.cwd(), 'zserial-diagnostics') } : {}),
                             autoOpen: true
                         }, function (err, results) {
                             if (obj.syncBackend && obj._closing) return;
@@ -965,6 +1032,9 @@ module.exports = function (RED) {
                         });
                         obj.serial.on('close', function () {
                             obj.isopen = false;
+                            assembleBuf = Buffer.alloc(0);
+                            recoveringFrame = false;
+                            obj._framePending = null;
                             if (!obj._closing) {
                                 if (olderr !== "unexpected") {
                                     olderr = "unexpected";
@@ -1043,389 +1113,187 @@ module.exports = function (RED) {
                         }
 
 
-                        // GNW 蓝牙帧：7E 7E 7E 5A  ...  CS  7E A5
-                        function tryParseBleGNW(input) {
-                            const b = input;
-                            if (b.length < 9) return { ok: false };                   // 最短：4起始 + 1LEN + 1CMD + 0DATA + 1CS + 2结束
-                            // 形态判定：必须以 7E 7E 7E 5A 开头
-                            if (!(b[0] === 0x7E && b[1] === 0x7E && b[2] === 0x7E && b[3] === 0x5A)) {
-                                // 若不是，看看后面是否有候选起点（容错脏字节）
-                                const n = b.indexOf(0x7E);
-                                if (n > 0) return { ok: false, used: n, frame: b.slice(0, n), err: "BLE_NO_7E7E7E5A_AT_START" };
-                                return { ok: false };
+                        const bleHeader = Buffer.from([0x7E, 0x7E, 0x7E, 0x5A]);
+
+                        function tryParseBleGNW(buf) {
+                            const proto = 'ble-gnw';
+                            if (buf.length < 5) return { proto, pending: true };
+                            const length = buf[4] + 3;
+                            if (length < 9) return { proto, err: 'BLE_LEN_MISMATCH' };
+                            if (buf.length < length) return { proto, pending: true };
+                            const frame = buf.subarray(0, length);
+                            if (frame[length - 2] !== 0x7E || frame[length - 1] !== 0xA5) {
+                                return { proto, frame, err: 'BLE_BAD_END' };
                             }
-
-                            // 向后找结束 A5，要求倒数第二个字节是 0x7E（结束符 7E A5）
-                            let endPos = -1;
-                            for (let i = 5; i < b.length; i++) {
-                                if (b[i] === 0xA5 && b[i - 1] === 0x7E) { endPos = i; break; }
+                            if (sum8(frame, 0, length - 3) !== frame[length - 3]) {
+                                return { proto, frame, err: 'BLE_CS_FAIL' };
                             }
-                            if (endPos === -1) return { ok: false };                  // 半包，继续累计
-
-                            const frame = b.slice(0, endPos + 1);                     // [0 .. A5]
-                            // 基本字段位置：len 在 [4]，cmd 在 [5]，CS 在倒数第3个字节
-                            const L = frame[4] >>> 0;
-                            const cs = frame[frame.length - 3] >>> 0;
-
-                            // （宽松）长度一致性：实测总长 T 与 L 的关系为 T = L + 3
-                            const T = frame.length;
-                            if ((T - 3) !== L) {
-                                // 不强制失败，给出“长度不一致”的错误帧提示并丢掉该段，避免卡死
-                                return { ok: false, used: frame.length, frame, err: "BLE_LEN_MISMATCH" };
-                            }
-
-                            // 和校验：从起始 0x7E 到 CS 之前所有字节累加低8位
-                            let sum = 0;
-                            for (let i = 0; i < frame.length - 3; i++) sum = (sum + (frame[i] >>> 0)) & 0xFF;
-                            if (sum !== cs) {
-                                return { ok: false, used: frame.length, frame, err: "BLE_CS_FAIL" };
-                            }
-
-                            return { ok: true, used: frame.length, frame };
-                        }
-                        // 645：FE* 68 + 6 addr + 68 + ctrl + len + data + cs + 16
-                        function tryParse645(input) {
-                            // 统计 FE 前导（仅用于 used，不参与 CS 计算）
-                            let feCount = 0;
-                            while (feCount < input.length && input[feCount] === 0xFE) feCount++;
-                            const b = input.slice(feCount);
-                            if (b.length < 12) return { ok: false };
-
-                            // 形态：68 + addr(6) + 68 + CTRL + LEN + DATA + CS + 16
-                            if (b[0] !== 0x68) {
-                                const n = b.indexOf(0x68, 1);
-                                if (n > 0) return { ok: false, used: feCount + n, frame: input.slice(0, feCount + n), err: "645_NO_68_AT_START" };
-                                return { ok: false };
-                            }
-                            if (b.length >= 8 && b[7] !== 0x68) {
-                                const n = b.indexOf(0x68, 1);
-                                if (n > 0) return { ok: false, used: feCount + n, frame: input.slice(0, feCount + n), err: "645_SECOND_68_NOT_FOUND" };
-                                return { ok: false };
-                            }
-                            if (b.length < 10) return { ok: false }; // 还缺 CTRL/LEN
-
-                            const len = b[9] >>> 0;
-                            const total = 12 + len;                    // 帧总长（含 CS 与 0x16）
-                            const endIdx = total - 1;                  // 末尾 0x16 索引
-                            const csIdx = total - 2;                  // ★ CS 在倒数第2个字节
-
-                            // CS 双模校验：
-                            //  - full：从第一个 0x68 起累加到 CS 前（不含 CS）
-                            //  - std ：从第二个 0x68 后（C+L+DATA）累加到 CS 前
-                            const csOK = (end) => {
-                                const e = end;               // e == total
-                                const cs = b[e - 2];         // CS 在倒数第2字节
-
-                                // full 模式
-                                const sFull = sum8(b, 0, e - 2);
-                                if (cs === sFull) return { ok: true, mode: 'full', calc: sFull };
-
-                                // std 模式（需确保第二个 0x68 存在于固定位置7）
-                                if (b.length >= 10 && b[7] === 0x68) {
-                                    // 第二个 0x68 后开始：CTRL(8) + LEN(9) + DATA...
-                                    const sStd = sum8(b, 8, e - 2);
-                                    if (cs === sStd) return { ok: true, mode: 'std', calc: sStd };
-                                    return { ok: false, mode: 'std', calc: sStd, calc_full: sFull };
-                                }
-                                return { ok: false, mode: 'full', calc: sFull };
-                            };
-
-                            // 1) 优先按 LEN 快速命中
-                            if (b.length >= total && b[endIdx] === 0x16) {
-                                const ck = csOK(total);
-                                if (ck && ck.ok) {
-                                    const frame = input.slice(0, feCount + total);
-                                    // 透出校验模式，便于排障：部分设备使用 std 模式
-                                    try {
-                                        frame._meta = Object.assign({}, frame._meta || {}, {
-                                            proto: '645',
-                                            cs_mode: ck.mode,
-                                            cs_calc: ck.calc
-                                        });
-                                    } catch (e) { }
-                                    return { ok: true, used: feCount + total, frame };
-                                }
-                            }
-
-                            // 2) 回溯：向后找 0x16 做候选结尾，再校验 CS（兼容异常 LEN/粘包）
-                            for (let end = 12; end <= b.length; end++) {
-                                if (b[end - 1] !== 0x16) continue;
-                                // 候选帧至少要有 …… + CS + 16，因此 end >= 13 且 csIdx=end-2 >= 0
-                                if (end >= 13) {
-                                    const ck = csOK(end);
-                                    if (ck && ck.ok) {
-                                        const frame = input.slice(0, feCount + end);
-                                        try {
-                                            frame._meta = Object.assign({}, frame._meta || {}, {
-                                                proto: '645',
-                                                cs_mode: ck.mode,
-                                                cs_calc: ck.calc
-                                            });
-                                        } catch (e) { }
-                                        return { ok: true, used: feCount + end, frame };
-                                    }
-                                }
-                            }
-
-                            // 3) 起始形态确定不对则丢 1 字节；否则继续等
-                            if (b.length >= 8 && b[7] !== 0x68) {
-                                return { ok: false, used: feCount + 1, frame: input.slice(0, feCount + 1), err: "645_BAD_SHAPE_DROP1" };
-                            }
-                            return { ok: false };
+                            return { proto, frame };
                         }
 
-                        // 698（68-LEN 变体）：68 LL LH C ... DATA ... FCS(2) 16 ；兼容 FE* 前导
-                        function tryParse698Len(input) {
-                            // 剥离前导 FE（注意：这里只做 698-LEN 侧的兼容；645 另有自己的 FE 处理）
-                            const b = stripFE(input);
-                            if (b.length < 6 || b[0] !== 0x68) return { ok: false };
+                        function tryParse645(buf) {
+                            const proto = '645';
+                            if (buf.length < 8) return { proto, pending: true };
+                            if (buf[7] !== 0x68) return {};
+                            if (buf.length < 10) return { proto, pending: true };
+                            const length = 12 + buf[9];
+                            if (buf.length < length) return { proto, pending: true };
+                            const frame = buf.subarray(0, length);
+                            if (frame[length - 1] !== 0x16) return { proto, frame, err: '645_BAD_END' };
 
-                            // ---- 读取长度域 ----
-                            // 68 [LL] [LH] [C] ... [FCS(lo)] [FCS(hi)] 16
-                            const LL = b[1] >>> 0;
-                            const LH = b[2] >>> 0;
+                            const cs = frame[length - 2];
+                            const full = sum8(frame, 0, length - 2);
+                            if (cs === full) return { proto, frame, meta: { cs_mode: 'full', cs_calc: full } };
 
-                            // Lraw 含单位位/保留位：bit14 为单位位（0=字节，1=KB）
-                            let Lraw = (LH << 8) | LL;
-                            const isKB = (Lraw & 0x4000) !== 0;
-                            Lraw &= 0x3FFF; // 清掉单位位/保留位，只留下数值
-
-                            // 绝大多数场景长度单位为“字节”；若遇到 KB 单位则折算
-                            const L = isKB ? (Lraw << 10) : Lraw; // KB -> *1024
-
-                            function isComplete645AtStart() {
-                                if (b.length < 12 || b[0] !== 0x68 || b[7] !== 0x68) return false;
-                                const len645 = b[9] >>> 0;
-                                const total645 = 12 + len645;
-                                if (total645 > b.length) return false;
-                                if (b[total645 - 1] !== 0x16) return false;
-                                const cs = b[total645 - 2] >>> 0;
-                                return cs === sum8(b, 0, total645 - 2) || cs === sum8(b, 8, total645 - 2);
-                            }
-
-                            // ------------------------ 关键防误判（核心修复点） ------------------------
-                            // 误判根因：645 帧形态为 68 + 6字节地址 + 68 ...，地址字节中“偶然出现 0x16”
-                            // 例如：68 02 80 16 00 00 00 68 ...
-                            // 若把 LL=0x02、LH=0x80 解读为 698-LEN 长度，则 L=2，expectedEnd=3，b[3]=0x16
-                            // 从而被 698-LEN 误判为 “68 02 80 16” 一帧，导致吞掉 645 的帧头并产生残片。
-
-                            // 约束 1：698-LEN 的 L 不可能极短（至少应包含：C + 头字段 + FCS(2)）
-                            // 这里给经验下限 6（偏保守，既能挡住 L=2，又尽量不误伤极端设备）
-                            // 若现场仍有碰撞，可把下限提高到 8 或 10（建议先保留 6）。
-                            const MIN_698_LEN_L = 10;
-                            if (L < MIN_698_LEN_L) {
-                                // 不消费任何字节，让后续 parser（如 645）继续尝试
-                                return { ok: false };
-                            }
-
-                            // 长度上限：防止错位/噪声把 L 解读成极大值导致 assembleBuf 长期等待。
-                            const MAX_698_LEN_L = 2048;
-                            if (L > MAX_698_LEN_L) {
-                                if (isComplete645AtStart()) return { ok: false };
-                                return { ok: false, used: 1, frame: input.slice(0, 1), err: "698_LEN_TOO_LARGE" };
-                            }
-
-                            // 约束 2：控制域 C 在 b[3]，不可能是 0x16（结束符）
-                            // 若 b[3] == 0x16，几乎必然是 645 地址域碰撞导致的误判
-                            if (b.length >= 4 && b[3] === 0x16) {
-                                return { ok: false };
-                            }
-                            // 约束 3：控制域功能码应为常见 698 值，避免把其它 0x68 开头数据误当成长 698 半包。
-                            const C = b[3] >>> 0;
-                            const func = C & 0x0F;
-                            if (!(func === 0x01 || func === 0x03)) {
-                                return { ok: false };
-                            }
-                            // ------------------------------------------------------------------------
-
-                            // 期望 0x16 的位置（相对 b 起点）：1 + L
-                            // 解释：L 表示从 LL 开始到 FCS(含) 之前的长度？各厂实现略有差异
-                            // 你现有逻辑采用 expectedEnd = 1 + L，并要求 b[expectedEnd] == 0x16
-                            const expectedEnd = 1 + L;
-
-                            // 半包：继续累积。这里必须显式告诉主循环“这是 698-LEN 半包”，
-                            // 否则后续 645 parser 会把第一个 0x68 当作错位字节丢掉。
-                            if (b.length < expectedEnd + 1) {
-                                // 若当前位置已经是完整且 CS 正确的 645 帧，让 645 parser 接管。
-                                // 不能仅凭 b[7] === 0x68 判断，否则会误伤 APDU 中第 8 字节刚好为 0x68 的正常 698 帧。
-                                if (isComplete645AtStart()) return { ok: false };
-                                return {
-                                    ok: false,
-                                    pending: true,
-                                    proto: '698-len',
-                                    expected: expectedEnd + 1,
-                                    have: b.length
-                                };
-                            }
-
-                            // 若 expectedEnd 位置不是 0x16，说明起点错位或存在脏字节
-                            // 这里消费 1 字节，避免死循环卡住
-                            if (b[expectedEnd] !== 0x16) {
-                                return { ok: false, used: 1, frame: input.slice(0, 1), err: "698_LEN_BAD_END" };
-                            }
-
-                            // ------------------------ FCS 校验（CRC-16/X.25） ------------------------
-                            // FCS 位于 0x16 前两字节，低字节在前（lo, hi）
-                            if (expectedEnd - 2 < 0) return { ok: false };
-
-                            const fcsLo = b[expectedEnd - 2];
-                            const fcsHi = b[expectedEnd - 1];
-                            const fcs = (fcsHi << 8) | fcsLo;
-
-                            // 不同实现对“CRC 覆盖范围”存在差异，常见两种：
-                            // A) 从 0x68 开始算到 FCS 前（不含 FCS 与 0x16）
-                            // B) 从 LL 开始算到 FCS 前（不含 FCS 与 0x16）
-                            const calcA = crc16x25(b, 0, expectedEnd - 2);
-                            const calcB = crc16x25(b, 1, expectedEnd - 2);
-                            const fcsOK = (calcA === fcs) || (calcB === fcs);
-
-                            // 边界完整但 FCS 不通过时上报错误帧；队首请求继续等待后续正确帧或最终超时。
-                            if (!fcsOK) {
-                                return {
-                                    ok: false,
-                                    used: expectedEnd + 1,
-                                    frame: b.slice(0, expectedEnd + 1),
-                                    fcs_ok: false,
-                                    fcs_frame: fcs,
-                                    fcs_calc_a: calcA,
-                                    fcs_calc_b: calcB,
-                                    err: "698_LEN_FCS_FAIL"
-                                };
-                            }
-
-                            // FCS 通过：返回完整帧（含 0x68..0x16）
-                            return {
-                                ok: true,
-                                used: expectedEnd + 1,
-                                frame: b.slice(0, expectedEnd + 1),
-                                fcs_ok: true
-                            };
+                            // Legacy devices in this deployment also use a checksum over C, L and DATA.
+                            const legacy = sum8(frame, 8, length - 2);
+                            if (cs === legacy) return { proto, frame, meta: { cs_mode: 'std', cs_calc: legacy } };
+                            return { proto, frame, err: '645_CS_FAIL' };
                         }
 
-                        // 698（HDLC）：7E ... [FCS(lo,hi)] 7E，支持 0x7D 转义与 X.25 FCS
-                        function tryParse698HDLC(input) {
-                            const b = input;
-                            if (b.length < 6) return { ok: false };
-                            if (b[0] !== 0x7E) return { ok: false };
-                            let endPos = -1;
-                            for (let i = 1; i < b.length; i++) { if (b[i] === 0x7E) { endPos = i; break; } }
-                            if (endPos === -1) return { ok: false };       // 半包
-                            const rawFrame = b.slice(0, endPos + 1);
-                            const payloadEscaped = b.slice(1, endPos);     // 去 7E
-                            const payload = unescapeHDLC(payloadEscaped);
-                            if (payload.length < 3) return { ok: false, used: endPos + 1, frame: rawFrame, err: "698_HDLC_TOO_SHORT" };
-                            const fcsLo = payload[payload.length - 2];
-                            const fcsHi = payload[payload.length - 1];
-                            const fcs = (fcsHi << 8) | fcsLo;
-                            const calc = crc16x25(payload, 0, payload.length - 2);
-                            if (calc !== fcs) return { ok: false, used: endPos + 1, frame: rawFrame, err: "698_HDLC_CRC_FAIL" };
-                            return { ok: true, used: endPos + 1, frame: rawFrame }; // 原始含 7E
-                        }
+                        function tryParse698Len(buf) {
+                            const proto = '698-len';
+                            if (buf.length < 5) return { proto, pending: true };
+                            const rawLength = buf.readUInt16LE(1);
+                            if (rawLength & 0x8000) return {};
+                            const units = (rawLength & 0x4000) ? 1024 : 1;
+                            const length = (rawLength & 0x3FFF) * units + 2;
+                            const fcsStart = length - 3;
+                            const control = buf[3];
 
-                        // 统一喂入器：抽帧、报错、剔噪
-                        function feedAndExtract(d, emitOk, emitErr) {
-                            if (!Buffer.isBuffer(d)) d = Buffer.from(d);
-                            assembleBuf = Buffer.concat([assembleBuf, d]);
-
-                            // 防溢出
-                            if (assembleBuf.length > bufMaxSize) {
-                                emitErr(Buffer.from(assembleBuf), "BUFFER_OVERFLOW_DROP_OLD");
-                                assembleBuf = Buffer.alloc(0);
-                                obj._framePending = null;
-                                return;
-                            }
-
-                            // 前导剔噪：仅保留以 FE/68/7E 开头；若以 FE 开头，剥离所有 FE 前导
-                            let s = 0;
-                            while (s < assembleBuf.length) {
-                                const c = assembleBuf[s];
-                                if (c === 0xFE || c === 0x68 || c === 0x7E) break;
-                                s++;
-                            }
-                            if (s > 0) assembleBuf = assembleBuf.slice(s);
-                            if (assembleBuf.length && assembleBuf[0] === 0xFE) {
-                                let k = 0; while (k < assembleBuf.length && assembleBuf[k] === 0xFE) k++;
-                                assembleBuf = assembleBuf.slice(k);
-                            }
-
-                            // 抽帧
-                            while (assembleBuf.length >= 5) {
-                                // // 优先 HDLC，再 645，再 698-Len（避免误判）
-                                // let r = tryParse698HDLC(assembleBuf);
-                                // if (!r.ok) r = tryParse645(assembleBuf);
-                                // if (!r.ok) r = tryParse698Len(assembleBuf);
-
-                                // --fix-20251213-先 BLE（7E7E7E5A…7EA5），再 698-HDLC，再 698-LEN，再 645
-                                // 关键：698-LEN 必须优先于 645，否则遇到 698 帧内出现 0x68（如示例报文第7字节）会被 645 误判并卡住
-                                let r = tryParseBleGNW(assembleBuf);
-                                if (!r.ok) r = tryParse698HDLC(assembleBuf);
-                                if (!r.ok) r = tryParse698Len(assembleBuf);
-                                if (!r.ok && r.pending) {
-                                    obj._framePending = Object.assign({}, r, {
-                                        since: (obj._framePending && obj._framePending.proto === r.proto) ? obj._framePending.since : Date.now()
-                                    });
+                            // The draft carries HCS after M, while the deployed 2017 layout carries
+                            // it after SA and CA. The existing decoder also accepts a two-byte CA.
+                            const firstHcs = 7 + (buf[4] & 0x0F);
+                            const hcsOffsets = (control & 0x04) ? [firstHcs] : [firstHcs, firstHcs + 1];
+                            let headerPending = false;
+                            let headerValid = false;
+                            for (const offset of hcsOffsets) {
+                                if (offset + 2 > fcsStart) continue;
+                                if (buf.length < offset + 2) {
+                                    headerPending = true;
+                                } else if (crc16x25(buf, 1, offset) === buf.readUInt16LE(offset)) {
+                                    headerValid = true;
                                     break;
                                 }
-                                if (!r.ok) r = tryParse645(assembleBuf);
-
-                                if (r.ok) {
-                                    obj._framePending = null;
-                                    // 附加解析元数据（例如 698 FCS 校验结果），供上层排障
-                                    if (r && typeof r === 'object') {
-                                        try {
-                                            r.frame._meta = {
-                                                proto: r.proto || undefined,
-                                                fcs_ok: (typeof r.fcs_ok === 'boolean') ? r.fcs_ok : undefined,
-                                                err: r.err || undefined,
-                                                fcs_frame: r.fcs_frame,
-                                                fcs_calc_a: r.fcs_calc_a,
-                                                fcs_calc_b: r.fcs_calc_b
-                                            };
-                                        } catch (e) {
-                                            // ignore
-                                        }
-                                    }
-                                    emitOk(r.frame);
-                                    assembleBuf = assembleBuf.slice(r.used);
-                                    continue;
-                                }
-                                if (r.used) {
-                                    obj._framePending = null;
-                                    const used = r.used >>> 0;
-                                    const frameBuf = r.frame ? Buffer.from(r.frame) : null;
-                                    const frameLen = frameBuf ? frameBuf.length : 0;
-                                    const errCode = (r && r.err) ? String(r.err) : "";
-                                    const isResyncDrop = (used <= 1) || (frameLen <= 1) ||
-                                        errCode === "DROP_7E_BADFRAME" ||
-                                        errCode === "645_BAD_SHAPE_DROP1" ||
-                                        errCode === "698_LEN_BAD_END" ||
-                                        errCode === "698_LEN_TOO_LARGE" ||
-                                        errCode === "645_SECOND_68_NOT_FOUND";
-
-                                    if (!isResyncDrop) {
-                                        obj._framePending = null;
-                                        try {
-                                            if (r.frame) {
-                                                r.frame._meta = Object.assign({}, r.frame._meta || {}, {
-                                                    proto: (r.fcs_ok === false) ? '698-len' : (r.proto || undefined),
-                                                    fcs_ok: (typeof r.fcs_ok === 'boolean') ? r.fcs_ok : undefined,
-                                                    fcs_frame: r.fcs_frame,
-                                                    fcs_calc_a: r.fcs_calc_a,
-                                                    fcs_calc_b: r.fcs_calc_b,
-                                                    err: r.err || "FRAME_INVALID"
-                                                });
-                                            }
-                                        } catch (e) {
-                                            // ignore：诊断信息不能影响主流程
-                                        }
-                                        emitErr(r.frame, errCode || "FRAME_INVALID");
-                                    }
-
-                                    assembleBuf = assembleBuf.slice(used);
-                                    continue;
-                                }
-                                break; // 需要更多数据
                             }
+                            if (!headerValid) return headerPending ? { proto, pending: true } : {};
+                            if (buf.length < length) return { proto, pending: true, trusted: true };
+
+                            const frame = buf.subarray(0, length);
+                            if (frame[length - 1] !== 0x16) return { proto, frame, trusted: true, err: '698_LEN_BAD_END' };
+                            const fcs = frame.readUInt16LE(fcsStart);
+                            const standard = crc16x25(frame, 1, fcsStart);
+                            const legacy = crc16x25(frame, 0, fcsStart);
+                            const valid = fcs === standard || fcs === legacy;
+                            return {
+                                proto, frame, trusted: true,
+                                err: valid ? undefined : '698_LEN_FCS_FAIL',
+                                meta: { fcs_ok: valid, fcs_frame: fcs, fcs_calc_a: legacy, fcs_calc_b: standard }
+                            };
+                        }
+
+                        function tryParseHDLC(buf) {
+                            const proto = '698-hdlc';
+                            const end = buf.indexOf(0x7E, 1);
+                            if (end === -1) return buf.length <= bufMaxSize ? { proto, pending: true } : { proto, err: 'HDLC_TOO_LONG' };
+                            if (end === 1) return {};
+                            const frame = buf.subarray(0, end + 1);
+                            const payload = unescapeHDLC(frame.subarray(1, end));
+                            if (payload.length < 3) return { proto, frame, err: '698_HDLC_TOO_SHORT' };
+                            const fcsStart = payload.length - 2;
+                            if (crc16x25(payload, 0, fcsStart) !== payload.readUInt16LE(fcsStart)) {
+                                return { proto, frame, err: '698_HDLC_CRC_FAIL' };
+                            }
+                            return { proto, frame };
+                        }
+
+                        function parseFrame(buf, expectedProto) {
+                            if (buf[0] === 0x7E) {
+                                const prefix = buf.subarray(0, bleHeader.length);
+                                if (prefix.equals(bleHeader.subarray(0, prefix.length))) return tryParseBleGNW(buf);
+                                return tryParseHDLC(buf);
+                            }
+                            if (buf[0] !== 0x68) return {};
+                            const meter = tryParse645(buf);
+                            const exchange = tryParse698Len(buf);
+                            if (expectedProto === '645' && meter.frame && !meter.err) return meter;
+                            if (exchange.err && meter.frame && !meter.err) return meter;
+                            if (exchange.trusted) return exchange;
+                            if (exchange.pending && (expectedProto === '698-len' || meter.err)) return exchange;
+                            if (meter.frame || meter.pending) return meter;
+                            return exchange;
+                        }
+
+                        function is645Reply(frame, request) {
+                            const control = frame[8];
+                            if (!(control & 0x80) || (control & 0x1F) !== (request[8] & 0x1F)) return false;
+                            for (let i = 1; i <= 6; i++) {
+                                if (request[i] !== 0xAA && frame[i] !== request[i]) return false;
+                            }
+                            // Normal read replies carry the request's DI. Error replies carry an error byte.
+                            if (!(control & 0x40) && [0x11, 0x12].includes(control & 0x1F)) {
+                                return frame[9] >= 4 && request[9] >= 4 &&
+                                    frame.subarray(10, 14).equals(request.subarray(10, 14));
+                            }
+                            return true;
+                        }
+
+                        function findValidFrame(buf, expectedProto) {
+                            for (let i = 1; i < buf.length; i++) {
+                                if (buf[i] !== 0x68 && buf[i] !== 0x7E) continue;
+                                const candidate = parseFrame(buf.subarray(i), expectedProto);
+                                if (candidate.frame && !candidate.err) return i;
+                            }
+                            return 0;
+                        }
+
+                        function feedAndExtract(d, request, emitOk, emitErr) {
+                            assembleBuf = Buffer.concat([assembleBuf, d]);
+                            const sent = Buffer.isBuffer(request?.payload) ? stripFE(request.payload) : null;
+                            const parsed = sent ? parseFrame(sent) : null;
+                            const expected = parsed?.frame && !parsed.err && parsed.frame.length === sent.length ? parsed.proto : undefined;
+                            const expectedProto = expected === '645' && (sent[8] & 0x80) ? undefined : expected;
+                            while (assembleBuf.length) {
+                                let start = 0;
+                                while (start < assembleBuf.length && assembleBuf[start] !== 0x68 && assembleBuf[start] !== 0x7E) start++;
+                                assembleBuf = assembleBuf.subarray(start);
+                                if (!assembleBuf.length) break;
+                                const result = parseFrame(assembleBuf, expectedProto);
+                                const { proto, frame, err, pending, meta } = result;
+                                if (pending) {
+                                    // After a rejected boundary, a marker inside the bad frame
+                                    // can look like a partial header and hide the following frame.
+                                    const next = recoveringFrame ? findValidFrame(assembleBuf, expectedProto) : 0;
+                                    if (next) {
+                                        assembleBuf = assembleBuf.subarray(next);
+                                        continue;
+                                    }
+                                    obj._framePending = {
+                                        proto,
+                                        since: obj._framePending?.proto === proto ? obj._framePending.since : Date.now()
+                                    };
+                                    return;
+                                }
+                                obj._framePending = null;
+
+                                if (!frame || err) {
+                                    // A corrupt length may overlap a following frame. Resume one byte later.
+                                    assembleBuf = assembleBuf.subarray(1);
+                                    if (err) {
+                                        recoveringFrame = true;
+                                        if (frame) emitErr(frame, err);
+                                    }
+                                    continue;
+                                }
+                                recoveringFrame = false;
+                                assembleBuf = assembleBuf.subarray(frame.length);
+                                if (proto === '645' && !(frame[8] & 0x80) && sent && frame.equals(sent)) continue;
+                                const related = (!expectedProto || proto === expectedProto) &&
+                                    (expectedProto !== '645' || is645Reply(frame, sent));
+                                emitOk(frame, { ...meta, proto }, related ? request : null);
+                            }
+                            obj._framePending = null;
+                            recoveringFrame = false;
                         }
 
                         /***** -------------------------------- Frame parsers for DL/T645 & DL/T698.45 (FULL) End -------------------------------- *****/
@@ -1452,27 +1320,21 @@ module.exports = function (RED) {
                             if (spliton === "frame") {
                                 feedAndExtract(
                                     d,
+                                    obj.queue[0],
                                     // 完整 OK 帧
-                                    function (frameBuf) {
+                                    function (frameBuf, meta, request) {
                                         // frame 模式下，务必保持 Buffer 原样输出（避免 0x00 等字节在字符串链路中被截断/损坏）
                                         // 同时附带 payload_hex 便于日志/排障。
                                         var m = Buffer.from(frameBuf);
-                                        var last_sender = null;
-                                        if (obj.queue.length) { last_sender = obj.queue[0].sender; }
-                                        var msgout = obj.dequeue() || {};
+                                        const msg = request && obj.queue[0] === request ? obj.dequeue() : null;
+                                        const msgout = msg || {};
                                         msgout.payload = m;
                                         msgout.payload_hex = m.toString('hex').toUpperCase();
                                         msgout.port = port;
                                         msgout.status = "OK";
-
-                                        // 若解析器附带了元数据（例如 698 FCS 校验结果），一并输出
-                                        if (frameBuf && frameBuf._meta) {
-                                            msgout.frame_meta = frameBuf._meta;
-                                            // 便于后续 GC：避免 assembleBuf 长期引用
-                                            try { delete frameBuf._meta; } catch (e) { }
-                                        }
-
-                                        obj._emitter.emit('data', msgout, last_sender);
+                                        msgout.frame_meta = meta;
+                                        if (!msg) msgout.is_unsolicited = true;
+                                        obj._emitter.emit('data', msgout, msg ? request.sender : null);
                                     },
                                     // 错误帧（已有边界但校验/结束符不通过）
                                     function (badBuf, reason) {
@@ -1554,19 +1416,37 @@ module.exports = function (RED) {
                 }());
                 return connections[id];
             },
-            close: function (port, done, node) {
+            close: function (port, done, node, flowClose) {
                 if (connections[port]) {
                     const connection = connections[port];
+                    if (flowClose && connection.keepOpen && connection.serial.isOpen && !connection.closePending) {
+                        connection.serial.trace('retain');
+                        done();
+                        return;
+                    }
                     if (connection.syncBackend) {
                         if (!connection.closePending) {
                             connection._closing = true;
                             clearTimeout(connection.tout);
-                            connection.closePending = Promise.resolve().then(() => new Promise((resolve, reject) => {
-                                connection.close(err => err ? reject(err) : resolve());
-                            })).finally(() => {
-                                if (connections[port] === connection) delete connections[port];
+                            const adapter = connection.serial;
+                            const release = () => {
+                                if (connections[port] !== connection) return;
+                                delete connections[port];
                                 _zemitter.emit('connNumChange', Object.keys(connections).length);
-                            }).then(() => { _zemitter.emit('afterClosed', port); });
+                                _zemitter.emit('afterClosed', port);
+                            };
+                            connection.closePending = Promise.resolve().then(() => new Promise((resolve, reject) => {
+                                connection.close(err => {
+                                    if (err && adapter.bridgePresent) {
+                                        // Keep the rejected promise visible to subsequent close/open
+                                        // requests. A late native exit releases this exact connection.
+                                        adapter.once('bridgeReleased', release);
+                                    } else {
+                                        release();
+                                    }
+                                    if (err) reject(err); else resolve();
+                                });
+                            }));
                         }
                         connection.closePending.then(() => done(), done);
                         return;
@@ -1599,11 +1479,11 @@ module.exports = function (RED) {
                     done();
                 }
             },
-            closeAll(done, node) {
+            closeAll(done, node, flowClose) {
                 serialPool.zlog(node, "开始关闭所有串口连接");
                 serialPool.zlog(node, connections);
                 var keys = Object.keys(connections), total = keys.length;
-                let closeError;
+                const closeErrors = [];
                 serialPool.zlog(node, "需要关闭的连接数: " + total);
 
                 // 如果没有连接需要关闭，立即完成
@@ -1615,13 +1495,13 @@ module.exports = function (RED) {
                 try {
                     for (var i = 0; i < keys.length; i++) {
                         serialPool.close(keys[i], function (err) {
-                            closeError = closeError || err;
+                            if (err) closeErrors.push(err);
                             total--;
                             if (total <= 0) {
-                                done(closeError);
+                                done(batchCloseError(closeErrors));
                                 serialPool.zlog(node, "全部关闭完成");
                             }
-                        }, node);
+                        }, node, flowClose);
                     }
                 } catch (error) {
                     done(error);

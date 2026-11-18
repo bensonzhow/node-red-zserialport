@@ -5,11 +5,11 @@
   "binaries": {
     "x86": {
       "file": "bin/windows/x86/zserial-sync.exe",
-      "sha256": "944ec1c32a65d962688d18583f25b00826a0ddfa5b57b9fac790f76a1f00b61b"
+      "sha256": "e5a11c3709461f197b348931536209657c2047fa1cf92ccf8b5db41cba5f53b8"
     },
     "x64": {
       "file": "bin/windows/x64/zserial-sync.exe",
-      "sha256": "9e986c3d7e4316c98730fa4bc848f15e7647703917f4c344d754d40824c03fde"
+      "sha256": "09bdba20558de20809cfd59b67484e580b6c53b27bf02a7a1b6cac8601d9c5bb"
     }
   }
 }
